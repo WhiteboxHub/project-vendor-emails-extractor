@@ -125,3 +125,29 @@ class EmailCleaner:
         except Exception as e:
             self.logger.error(f"Error extracting email body: {str(e)}")
             return ""
+
+    def clean_text(self, text: str) -> str:
+        """
+        Clean plain text content (subject, body, etc.)
+        
+        Args:
+            text: Raw text content
+            
+        Returns:
+            Cleaned text
+        """
+        if not text:
+            return ""
+        
+        try:
+            # Remove quoted replies
+            text = self._remove_quoted_replies(text)
+            
+            # Normalize whitespace
+            text = self._normalize_whitespace(text)
+            
+            return text.strip()
+            
+        except Exception as e:
+            self.logger.error(f"Error cleaning text: {str(e)}")
+            return text.strip() if text else ""

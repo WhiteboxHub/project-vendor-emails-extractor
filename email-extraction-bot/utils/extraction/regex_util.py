@@ -8,7 +8,7 @@ logger = logging.getLogger(__name__)
 class RegexExtractor:
     """Extract contact information using regex patterns"""
     
-    def __init__(self):
+    def __init__(self, email_filter=None):
         self.email_pattern = re.compile(
             r'[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+',
             re.IGNORECASE
@@ -20,6 +20,7 @@ class RegexExtractor:
         )
         
         self.logger = logging.getLogger(__name__)
+        self.email_filter = email_filter  # DB-driven filter
         
         # Personal/consumer email domains to block
         self.personal_domains = {
@@ -86,42 +87,36 @@ class RegexExtractor:
             return False
     
     def extract_email(self, text: str) -> Optional[str]:
-        """Extract email address from text, excluding personal emails (Gmail, Yahoo, etc.)"""
+        """Extract email address from text using DB filters"""
         try:
-            # Get all emails
             emails = self.email_pattern.findall(text)
             if not emails:
                 return None
-            
-            # Filter out common automated emails
-            blacklist_prefixes = ['noreply', 'no-reply', 'donotreply', 'info', 'support', 
-                                 'admin', 'notifications', 'newsletter', 'mailer']
             
             valid_emails = []
             for email in emails:
                 email_lower = email.lower()
                 
-                # FIRST: Validate email format (filter out CID references)
+                # Validate format
                 if not self._is_valid_email_format(email_lower):
                     continue
                 
-                # Skip personal email domains (Gmail, Yahoo, etc.)
-                if self._is_personal_email(email_lower):
-                    self.logger.debug(f"Skipped personal email: {email_lower}")
-                    continue
+                # Use DB filter if available
+                if self.email_filter:
+                    if not self.email_filter.is_email_allowed(email_lower):
+                        self.logger.debug(f"Skipped email (DB filter): {email_lower}")
+                        continue
+                else:
+                    # Fallback: basic check
+                    if '@' not in email_lower or '.' not in email_lower.split('@')[1]:
+                        continue
                 
-                # Skip blacklisted prefixes
-                if any(email_lower.startswith(prefix) for prefix in blacklist_prefixes):
-                    continue
-                    
                 valid_emails.append(email_lower)
             
-            # Return first valid email
             if valid_emails:
-                self.logger.debug(f"Extracted business email: {valid_emails[0]}")
+                self.logger.debug(f"Extracted email: {valid_emails[0]}")
                 return valid_emails[0]
             
-            self.logger.debug("No valid business emails found")
             return None
             
         except Exception as e:

@@ -65,10 +65,12 @@ class EmailExtractionService:
         )
 
         self.cleaner = EmailCleaner()
-        self.extractor = ContactExtractor(self.config)
-
-        # EmailFilter MUST be DB-driven
+        
+        # EmailFilter MUST be DB-driven and initialized first
         self.email_filter = EmailFilter(self.config, db_config)
+        
+        # Pass EmailFilter to ContactExtractor
+        self.extractor = ContactExtractor(self.config, email_filter=self.email_filter)
 
         # UID tracker
         self.uid_tracker = get_uid_tracker("last_run.json")

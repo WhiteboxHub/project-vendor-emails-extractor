@@ -2,33 +2,32 @@ import re
 import os
 import joblib
 import logging
-from typing import Dict, List
+from typing import Dict, List, Optional
 from email.utils import parseaddr
+import mysql.connector
 
 logger = logging.getLogger(__name__)
 
 
 class EmailFilter:
     """
-    DB-driven email filtering engine.
-    - Priority-based allow/block rules
+    DB-driven email filtering engine - NO HARDCODED FILTERS.
+    - Priority-based allow/block rules from database
     - Content scoring using DB weights & targets
+    - Validates ALL email addresses (sender, extracted, etc.)
     - Optional ML classifier
     - Calendar invite support
     """
 
-    HUMAN_LOCAL_PATTERN = re.compile(
-        r"^[a-z]+([._-][a-z]+){0,2}$", re.IGNORECASE)
-
-    def __init__(self, config: dict, db_conn):
+    def __init__(self, config: dict, db_config: dict):
         self.config = config
+        self.db_config = db_config
         self.logger = logging.getLogger(__name__)
 
         # DB-loaded rules (priority ordered)
-        self.rules: List[Dict] = []
-
-        # Content rules
-        self.content_rules: List[Dict] = []
+        self.sender_rules: List[Dict] = []  # For sender filtering
+        self.email_rules: List[Dict] = []  # For extracted email validation
+        self.content_rules: List[Dict] = []  # For content scoring
 
         # ML classifier
         self.use_ml = config.get("filters", {}).get("use_ml_classifier", False)
@@ -36,7 +35,7 @@ class EmailFilter:
         self.vectorizer = None
 
         # Load rules from DB
-        self._load_rules_from_db(db_conn)
+        self._load_rules_from_db()
 
         if self.use_ml:
             self._load_ml_model()
@@ -44,49 +43,66 @@ class EmailFilter:
     # --------------------------------------------------
     # DB RULE LOADING
     # --------------------------------------------------
-    def _load_rules_from_db(self, conn):
-        cursor = conn.cursor(dictionary=True)
-        cursor.execute(
-            """
-            SELECT category, keywords, match_type, action, priority, weight, target
-            FROM job_automation_keywords
-            WHERE is_active = 1
-            ORDER BY priority ASC
-            """
-        )
-        rows = cursor.fetchall()
-        cursor.close()
+    def _load_rules_from_db(self):
+        """Load all rules from database - NO HARDCODED VALUES"""
+        try:
+            conn = mysql.connector.connect(**self.db_config)
+            cursor = conn.cursor(dictionary=True)
+            
+            cursor.execute(
+                """
+                SELECT category, keywords, match_type, action, priority, 
+                       COALESCE(weight, 1) as weight, 
+                       COALESCE(target, 'both') as target
+                FROM job_automation_keywords
+                WHERE is_active = 1 AND source = 'email_extractor'
+                ORDER BY priority ASC
+                """
+            )
+            rows = cursor.fetchall()
+            cursor.close()
+            conn.close()
 
-        for row in rows:
-            keywords = [
-                k.strip().lower() for k in row["keywords"].split(",") if k.strip()
-            ]
+            for row in rows:
+                keywords = [
+                    k.strip().lower() for k in row["keywords"].split(",") if k.strip()
+                ]
 
-            # Compile regex if needed
-            if row["match_type"] == "regex":
-                keywords = [re.compile(k, re.IGNORECASE) for k in keywords]
+                # Compile regex if needed
+                if row["match_type"] == "regex":
+                    try:
+                        keywords = [re.compile(k, re.IGNORECASE) for k in keywords]
+                    except re.error as e:
+                        self.logger.warning(f"Invalid regex in {row['category']}: {e}")
+                        continue
 
-            rule = {
-                "category": row["category"],
-                "match_type": row["match_type"],
-                "action": row["action"],
-                "priority": row["priority"],
-                "keywords": keywords,
-                "weight": row.get("weight", 1),
-                "target": row.get("target", "both"),
-            }
+                rule = {
+                    "category": row["category"],
+                    "match_type": row["match_type"],
+                    "action": row["action"],
+                    "priority": row["priority"],
+                    "keywords": keywords,
+                    "weight": row["weight"],
+                    "target": row["target"],
+                }
 
-            # Separate content rules
-            if row["category"] in ["recruiter_keywords", "anti_recruiter_keywords"]:
-                self.content_rules.append(rule)
-            else:
-                self.rules.append(rule)
+                # Separate rules by type
+                if row["category"] in ["recruiter_keywords", "anti_recruiter_keywords"]:
+                    self.content_rules.append(rule)
+                else:
+                    # All other rules apply to both sender and extracted emails
+                    self.sender_rules.append(rule)
+                    self.email_rules.append(rule)
 
-        self.logger.info(
-            "Loaded %d DB rules (%d content rules)",
-            len(self.rules),
-            len(self.content_rules),
-        )
+            self.logger.info(
+                "Loaded %d sender/email rules, %d content rules from DB",
+                len(self.sender_rules),
+                len(self.content_rules),
+            )
+
+        except Exception as e:
+            self.logger.error(f"Failed to load DB rules: {e}")
+            raise
 
     # --------------------------------------------------
     # ML SUPPORT
@@ -111,95 +127,133 @@ class EmailFilter:
     # --------------------------------------------------
     # UTILS
     # --------------------------------------------------
-    def _extract_email(self, from_header: str) -> str | None:
-        _, email = parseaddr(from_header or "")
+    def _extract_email(self, from_header: str) -> Optional[str]:
+        """Extract email address from header"""
+        if not from_header:
+            return None
+        _, email = parseaddr(from_header)
         email = email.lower().strip()
         return email if "@" in email else None
 
-    def _looks_like_random_token(self, token: str) -> bool:
-        if len(token) >= 10 and re.search(r"\d", token):
-            return True
-        if re.fullmatch(r"[a-f0-9]{8,}", token):
-            return True
-        return False
-
     def _rule_matches(self, email: str, rule: Dict) -> bool:
-        local, domain = email.split("@", 1)
+        """
+        Check if email matches a rule - handles exact, contains, and regex
+        """
+        if not email or "@" not in email:
+            return False
+
+        email_lower = email.lower()
+        local_part = email.split("@")[0].lower()
+        domain = email.split("@")[1].lower()
+
         for kw in rule["keywords"]:
             if rule["match_type"] == "exact":
-                if email == kw or domain == kw or local == kw:
+                # Check exact match against full email, domain, or local part
+                if email_lower == kw or domain == kw or local_part == kw:
                     return True
             elif rule["match_type"] == "contains":
-                if kw in email:
+                # Check if keyword is contained in email
+                if isinstance(kw, str) and kw in email_lower:
                     return True
             elif rule["match_type"] == "regex":
-                if kw.search(email):
-                    return True
+                # Regex match against full email
+                if isinstance(kw, re.Pattern):
+                    if kw.search(email_lower):
+                        return True
+
         return False
+
+    # --------------------------------------------------
+    # EMAIL VALIDATION (for extracted emails)
+    # --------------------------------------------------
+    def is_email_allowed(self, email: str) -> bool:
+        """
+        Validate extracted email against DB rules.
+        Returns True if email should be allowed, False if blocked.
+        
+        Priority order:
+        1. Allowlist rules (priority 1-2) - if match, allow
+        2. Blocklist rules (priority 50-100) - if match, block
+        3. Default: allow (if no rules match)
+        """
+        if not email or "@" not in email:
+            return False
+
+        email_lower = email.lower().strip()
+
+        # Process rules in priority order (already sorted)
+        for rule in self.email_rules:
+            if self._rule_matches(email_lower, rule):
+                action = rule["action"]
+                self.logger.debug(
+                    f"Email {email_lower} → {action} ({rule['category']}, priority {rule['priority']})"
+                )
+                return action == "allow"
+
+        # Default: allow if no rules match
+        return True
+
+    def is_email_blocked(self, email: str) -> bool:
+        """Check if email is blocked - inverse of is_email_allowed"""
+        return not self.is_email_allowed(email)
 
     # --------------------------------------------------
     # SENDER FILTER
     # --------------------------------------------------
-    def is_junk_email(self, from_header: str) -> bool:
-        email = self._extract_email(from_header)
-        if not email:
-            return True
-
-        for rule in self.rules:
-            if self._rule_matches(email, rule):
-                return rule["action"] == "block"
-
-        # Fallback for random-looking local part
-        local = email.split("@")[0]
-        tokens = re.split(r"[._\-+]", local)
-        for token in tokens:
-            if self._looks_like_random_token(token):
-                return True
-
-        return False
-
     def check_sender(self, email_data: Dict) -> str:
-        msg = email_data["message"]
-        from_header = msg.get("From", "")
+        """
+        Check sender email against DB rules.
+        Returns 'allow' or 'block' based on priority-ordered rules.
+        """
+        msg = email_data.get("message") if isinstance(email_data, dict) else email_data
+        from_header = msg.get("From", "") if hasattr(msg, "get") else getattr(msg, "From", "")
         email = self._extract_email(from_header)
+        
         if not email:
             return "block"
 
-        for rule in self.rules:
+        # Process rules in priority order
+        for rule in self.sender_rules:
             if self._rule_matches(email, rule):
+                action = rule["action"]
                 self.logger.debug(
-                    "Sender %s → %s (%s)", email, rule["action"], rule["category"]
+                    f"Sender {email} → {action} ({rule['category']}, priority {rule['priority']})"
                 )
-                return rule["action"]
+                return action
 
-        local = email.split("@")[0]
-        tokens = re.split(r"[._\-+]", local)
-        for token in tokens:
-            if self._looks_like_random_token(token):
-                return "block"
+        # Default: allow if no rules match
         return "allow"
+
+    def is_junk_email(self, from_header: str) -> bool:
+        """Legacy method - checks if sender is junk"""
+        email = self._extract_email(from_header)
+        if not email:
+            return True
+        return self.check_sender({"message": {"From": from_header}}) == "block"
 
     # --------------------------------------------------
     # CONTENT SCORING
     # --------------------------------------------------
     def score_content(self, subject: str, body: str) -> int:
+        """Score email content using DB keyword weights"""
         score = 0
-        subject_lower = subject.lower()
-        body_lower = body.lower()
-        full_text = f"{subject_lower} {body_lower}"
+        subject_lower = (subject or "").lower()
+        body_lower = (body or "").lower()
 
         for rule in self.content_rules:
-            weight = rule["weight"]
-            target = rule["target"]
+            weight = rule.get("weight", 1)
+            target = rule.get("target", "both")
 
             for kw in rule["keywords"]:
-                hit = False
-                if target in ["subject", "both"] and kw in subject_lower:
-                    hit = True
-                if target in ["body", "both"] and kw in body_lower:
-                    hit = True
-                if hit:
-                    score += weight
+                if isinstance(kw, str):
+                    hit = False
+                    if target in ["subject", "both"] and kw in subject_lower:
+                        hit = True
+                    if target in ["body", "both"] and kw in body_lower:
+                        hit = True
+                    if hit:
+                        score += weight
+                        self.logger.debug(f"Content match: '{kw}' → +{weight} (score: {score})")
 
         return score
 
@@ -207,6 +261,7 @@ class EmailFilter:
     # RECRUITER DETECTION
     # --------------------------------------------------
     def is_recruiter_email(self, subject: str, body: str, from_header: str) -> bool:
+        """Check if email is from a recruiter"""
         if self.is_junk_email(from_header):
             return False
 
@@ -227,10 +282,12 @@ class EmailFilter:
     # CALENDAR SUPPORT
     # --------------------------------------------------
     def is_calendar_invite(self, email_message) -> bool:
+        """Check if email is a calendar invite"""
         try:
-            for part in email_message.walk():
-                if part.get_content_type() == "text/calendar":
-                    return True
+            if hasattr(email_message, "walk"):
+                for part in email_message.walk():
+                    if part.get_content_type() == "text/calendar":
+                        return True
             return False
         except Exception:
             return False
@@ -239,6 +296,7 @@ class EmailFilter:
     # PIPELINE HELPER
     # --------------------------------------------------
     def filter_emails(self, emails: List[Dict], cleaner) -> List[Dict]:
+        """Filter emails using DB rules"""
         filtered = []
 
         for email_data in emails:
