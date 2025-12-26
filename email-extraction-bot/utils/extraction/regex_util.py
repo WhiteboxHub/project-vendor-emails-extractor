@@ -21,28 +21,21 @@ class RegexExtractor:
         
         self.logger = logging.getLogger(__name__)
         self.email_filter = email_filter  # DB-driven filter
-        
-        # Personal/consumer email domains to block
-        self.personal_domains = {
-            'gmail.com', 'googlemail.com', 'yahoo.com', 'yahoo.co.uk', 'yahoo.in',
-            'outlook.com', 'hotmail.com', 'live.com', 'msn.com',
-            'icloud.com', 'me.com', 'mac.com',
-            'aol.com', 'protonmail.com', 'proton.me', 'pm.me',
-            'mail.com', 'zoho.com', 'yandex.com', 'yandex.ru',
-            'gmx.com', 'gmx.net', 'tutanota.com', 'tutanota.de',
-            'fastmail.com', 'hushmail.com', 'mailfence.com'
-        }
     
     def _is_personal_email(self, email: str) -> bool:
-        """Check if email is from a personal/consumer domain (Gmail, Yahoo, etc.)"""
+        """
+        DEPRECATED: Use email_filter.is_email_allowed() instead which uses DB rules.
+        Kept for backward compatibility - now delegates to DB filter.
+        """
         if not email or '@' not in email:
             return True
         
-        try:
-            domain = email.split('@')[1].lower()
-            return domain in self.personal_domains
-        except:
-            return True
+        # Use DB filter if available
+        if self.email_filter:
+            return not self.email_filter.is_email_allowed(email)
+        
+        # Fallback: basic check (should not be used if DB filter is available)
+        return False
     
     def _is_valid_email_format(self, email: str) -> bool:
         """Validate email format and filter out CID references and fake emails

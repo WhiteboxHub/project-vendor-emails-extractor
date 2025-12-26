@@ -1,6 +1,6 @@
 from typing import Dict, Optional, List
 import logging
-from email.utils import parseaddr
+from email.utils import parseaddr, getaddresses
 import re
 
 from .regex_util import RegexExtractor
@@ -70,20 +70,26 @@ class ContactExtractor:
             if from_email and self._is_valid_email(from_email):
                 all_emails.append(('from', from_email))
 
-            # 4. CC/BCC headers
+            # 4. To header (extract all To recipients)
+            to_emails = self._extract_to_emails(email_message)
+            for to_email in to_emails:
+                if self._is_valid_email(to_email):
+                    all_emails.append(('to', to_email))
+
+            # 5. CC/BCC headers
             cc_emails = self._extract_cc_bcc_emails(email_message)
             for cc_email in cc_emails:
                 if self._is_valid_email(cc_email):
                     all_emails.append(('cc', cc_email))
 
-            # 5. Calendar invite emails
+            # 6. Calendar invite emails
             calendar_emails = self._extract_calendar_email(email_message)
             if calendar_emails:
                 for cal_email in calendar_emails:
                     if self._is_valid_email(cal_email):
                         all_emails.append(('calendar', cal_email))
 
-            # 6. Body extraction (lowest priority)
+            # 7. Body extraction (lowest priority)
             body_email = self._extract_field('email', clean_body, email_message)
             if body_email and self._is_valid_email(body_email):
                 all_emails.append(('body', body_email))
@@ -266,10 +272,16 @@ class ContactExtractor:
         return None
 
     def _is_valid_name(self, name: str, source_email: str) -> bool:
+        """
+        Validate name using DB rules from job_automation_keywords table.
+        Falls back to basic validation if DB rules not available.
+        """
         if not name or len(name.strip()) < 2:
             return False
         name_lower = name.lower().strip()
         words = name.split()
+        
+        # Basic format validation
         if len(words) == 1:
             if len(name) < 3 or any(c.isdigit() for c in name):
                 return False
@@ -277,65 +289,89 @@ class ContactExtractor:
             return False
         if any(c.isdigit() for c in name):
             return False
-        job_titles = [
-            'recruiter', 'manager', 'director', 'engineer', 'developer',
-            'architect', 'specialist', 'coordinator', 'analyst', 'consultant',
-            'lead', 'senior', 'junior', 'principal', 'executive', 'president',
-            'ceo', 'cto', 'cfo', 'coo', 'founder', 'partner', 'vp', 'vice president'
-        ]
-        if any(title in name_lower for title in job_titles):
-            return False
-        location_indicators = ['city', 'state', 'county', 'street', 'avenue', 'road', 'drive']
-        if any(indicator in name_lower for indicator in location_indicators):
-            return False
         if name.isupper() and len(name) > 5:
             return False
-        company_indicators = ['inc', 'llc', 'corp', 'ltd', 'company', 'technologies', 'solutions', 'systems']
-        if any(indicator in name_lower for indicator in company_indicators):
-            return False
+        
+        # Use DB rules if email_filter is available
+        if self.email_filter and hasattr(self.email_filter, '_check_name_against_db_rules'):
+            if not self.email_filter._check_name_against_db_rules(name_lower):
+                return False
+        else:
+            # Fallback: basic validation (will be replaced by DB rules)
+            # Check against common invalid patterns
+            job_titles = [
+                'recruiter', 'manager', 'director', 'engineer', 'developer',
+                'architect', 'specialist', 'coordinator', 'analyst', 'consultant',
+                'lead', 'senior', 'junior', 'principal', 'executive', 'president',
+                'ceo', 'cto', 'cfo', 'coo', 'founder', 'partner', 'vp', 'vice president'
+            ]
+            if any(title in name_lower for title in job_titles):
+                return False
+            location_indicators = ['city', 'state', 'county', 'street', 'avenue', 'road', 'drive']
+            if any(indicator in name_lower for indicator in location_indicators):
+                return False
+            company_indicators = ['inc', 'llc', 'corp', 'ltd', 'company', 'technologies', 'solutions', 'systems']
+            if any(indicator in name_lower for indicator in company_indicators):
+                return False
+            generic_names = ['dear', 'hi', 'hello', 'team', 'sir', 'madam', 'folks', 'all']
+            if any(generic in name_lower for generic in generic_names):
+                return False
+        
+        # Check if name matches source email (likely not a real name)
         if source_email:
             email_local = source_email.split('@')[0].lower()
             name_parts = [w.lower() for w in words if len(w) >= 3]
             matches = sum(1 for part in name_parts if part in email_local)
             if matches >= 2:
                 return False
-        generic_names = ['dear', 'hi', 'hello', 'team', 'sir', 'madam', 'folks', 'all']
-        if any(generic in name_lower for generic in generic_names):
-            return False
+        
         return True
 
     def _is_valid_company(self, company: str) -> bool:
+        """
+        Validate company using DB rules from job_automation_keywords table.
+        Falls back to basic validation if DB rules not available.
+        """
         if not company or len(company.strip()) < 2:
             return False
+        
         company_lower = company.lower().strip()
         if len(company) > 100:
             return False
-        sentence_indicators = [
-            'we have', 'i would like', 'please', 'thank you', 'looking for',
-            'excellent opportunity', 'job opportunity', 'position', 'role',
-            'location:', 'remote', 'onsite', 'hybrid', 'w2', 'c2c', '1099'
-        ]
-        if any(indicator in company_lower for indicator in sentence_indicators):
-            return False
-        job_titles = [
-            'recruiter', 'technical recruiter', 'senior recruiter', 'lead recruiter',
-            'manager', 'director', 'engineer', 'developer', 'architect'
-        ]
-        if any(title in company_lower for title in job_titles):
-            return False
-        location_patterns = [
-            r'\d{5}',  # ZIP codes
-            r'[A-Z]{2}\s*\d{5}',  # State ZIP
-            r'\(.*\)',  # Parentheses (often locations)
-        ]
-        for pattern in location_patterns:
-            if re.search(pattern, company):
+        
+        # Use DB rules if email_filter is available
+        if self.email_filter and hasattr(self.email_filter, '_check_company_against_db_rules'):
+            if not self.email_filter._check_company_against_db_rules(company_lower):
                 return False
-        if len(company.split()) == 1 and len(company) <= 3:
-            return False
-        non_company = ['none', 'n/a', 'na', 'tbd', 'remote', 'onsite', 'hybrid']
-        if company_lower in non_company:
-            return False
+        else:
+            # Fallback: basic validation (will be replaced by DB rules)
+            sentence_indicators = [
+                'we have', 'i would like', 'please', 'thank you', 'looking for',
+                'excellent opportunity', 'job opportunity', 'position', 'role',
+                'location:', 'remote', 'onsite', 'hybrid', 'w2', 'c2c', '1099'
+            ]
+            if any(indicator in company_lower for indicator in sentence_indicators):
+                return False
+            job_titles = [
+                'recruiter', 'technical recruiter', 'senior recruiter', 'lead recruiter',
+                'manager', 'director', 'engineer', 'developer', 'architect'
+            ]
+            if any(title in company_lower for title in job_titles):
+                return False
+            location_patterns = [
+                r'\d{5}',  # ZIP codes
+                r'[A-Z]{2}\s*\d{5}',  # State ZIP
+                r'\(.*\)',  # Parentheses (often locations)
+            ]
+            for pattern in location_patterns:
+                if re.search(pattern, company):
+                    return False
+            if len(company.split()) == 1 and len(company) <= 3:
+                return False
+            non_company = ['none', 'n/a', 'na', 'tbd', 'remote', 'onsite', 'hybrid']
+            if company_lower in non_company:
+                return False
+        
         return True
 
     def _is_valid_location(self, location: str) -> bool:
@@ -410,115 +446,179 @@ class ContactExtractor:
         return self._is_valid_email(email)
 
     def _extract_reply_to_email(self, email_message) -> Optional[str]:
+        """
+        Extract Reply-To email using RFC-compliant parsing.
+        Returns the first valid email address from Reply-To header.
+        """
         try:
             reply_to = email_message.get('Reply-To', '')
             if reply_to:
-                _, email_addr = parseaddr(reply_to)
-                if email_addr and '@' in email_addr:
-                    email_lower = email_addr.lower()
-                    if self._is_valid_header_email(email_lower):
-                        self.logger.debug(f"✓ Extracted Reply-To: {email_lower}")
-                        return email_lower
+                # Use getaddresses for proper RFC parsing
+                addresses = getaddresses([reply_to])
+                for name, email_addr in addresses:
+                    if email_addr and '@' in email_addr:
+                        email_lower = email_addr.lower().strip()
+                        if self._is_valid_header_email(email_lower):
+                            self.logger.debug(f"✓ Extracted Reply-To: {email_lower}")
+                            return email_lower
         except Exception as e:
-            self.logger.error(f"Error extracting Reply-To: {str(e)}")
+            self.logger.error(f"Error extracting Reply-To: {str(e)}", exc_info=True)
         return None
 
     def _extract_sender_email(self, email_message) -> Optional[str]:
+        """
+        Extract Sender email using RFC-compliant parsing.
+        Returns the first valid email address from Sender header.
+        """
         try:
             sender = email_message.get('Sender', '')
             if sender:
-                _, email_addr = parseaddr(sender)
-                if email_addr and '@' in email_addr:
-                    email_lower = email_addr.lower()
-                    if self._is_valid_header_email(email_lower):
-                        self.logger.debug(f"✓ Extracted Sender: {email_lower}")
-                        return email_lower
+                # Use getaddresses for proper RFC parsing
+                addresses = getaddresses([sender])
+                for name, email_addr in addresses:
+                    if email_addr and '@' in email_addr:
+                        email_lower = email_addr.lower().strip()
+                        if self._is_valid_header_email(email_lower):
+                            self.logger.debug(f"✓ Extracted Sender: {email_lower}")
+                            return email_lower
         except Exception as e:
-            self.logger.error(f"Error extracting Sender: {str(e)}")
+            self.logger.error(f"Error extracting Sender: {str(e)}", exc_info=True)
         return None
 
     def _extract_from_header(self, email_message) -> Optional[str]:
+        """
+        Extract From email using RFC-compliant parsing.
+        Returns the first valid email address from From header.
+        """
         try:
             from_header = email_message.get('From', '')
             if from_header:
-                _, email_addr = parseaddr(from_header)
-                if email_addr and '@' in email_addr:
-                    email_lower = email_addr.lower()
-                    if self._is_valid_header_email(email_lower):
-                        self.logger.debug(f"✓ Extracted From: {email_lower}")
-                        return email_lower
+                # Use getaddresses for proper RFC parsing
+                addresses = getaddresses([from_header])
+                for name, email_addr in addresses:
+                    if email_addr and '@' in email_addr:
+                        email_lower = email_addr.lower().strip()
+                        if self._is_valid_header_email(email_lower):
+                            self.logger.debug(f"✓ Extracted From: {email_lower}")
+                            return email_lower
         except Exception as e:
-            self.logger.error(f"Error extracting From: {str(e)}")
+            self.logger.error(f"Error extracting From: {str(e)}", exc_info=True)
         return None
 
-    def _extract_cc_bcc_emails(self, email_message) -> List[str]:
+    def _extract_to_emails(self, email_message) -> List[str]:
+        """
+        Extract To emails using RFC-compliant parsing.
+        Uses getaddresses() to properly handle multi-address headers.
+        """
         emails = []
         try:
+            to_header = email_message.get('To', '')
+            if to_header:
+                # getaddresses handles RFC-compliant formats with commas in names
+                to_addresses = getaddresses([to_header])
+                for name, email_addr in to_addresses:
+                    if email_addr and '@' in email_addr:
+                        email_lower = email_addr.lower().strip()
+                        if self._is_valid_header_email(email_lower):
+                            emails.append(email_lower)
+                            self.logger.debug(f"✓ Extracted To: {email_lower}")
+        except Exception as e:
+            self.logger.error(f"Error extracting To: {str(e)}", exc_info=True)
+        return emails
+
+    def _extract_cc_bcc_emails(self, email_message) -> List[str]:
+        """
+        Extract CC and BCC emails using RFC-compliant parsing.
+        Uses getaddresses() to properly handle multi-address headers.
+        """
+        emails = []
+        try:
+            # Extract CC emails - use getaddresses for proper RFC parsing
             cc_header = email_message.get('Cc', '')
             if cc_header:
-                for addr in cc_header.split(','):
-                    _, email_addr = parseaddr(addr.strip())
+                # getaddresses handles RFC-compliant formats with commas in names
+                cc_addresses = getaddresses([cc_header])
+                for name, email_addr in cc_addresses:
                     if email_addr and '@' in email_addr:
-                        email_lower = email_addr.lower()
+                        email_lower = email_addr.lower().strip()
                         if self._is_valid_header_email(email_lower):
                             emails.append(email_lower)
                             self.logger.debug(f"✓ Extracted CC: {email_lower}")
+            
+            # Extract BCC emails
             bcc_header = email_message.get('Bcc', '')
             if bcc_header:
-                for addr in bcc_header.split(','):
-                    _, email_addr = parseaddr(addr.strip())
+                bcc_addresses = getaddresses([bcc_header])
+                for name, email_addr in bcc_addresses:
                     if email_addr and '@' in email_addr:
-                        email_lower = email_addr.lower()
+                        email_lower = email_addr.lower().strip()
                         if self._is_valid_header_email(email_lower):
                             emails.append(email_lower)
                             self.logger.debug(f"✓ Extracted BCC: {email_lower}")
         except Exception as e:
-            self.logger.error(f"Error extracting CC/BCC: {str(e)}")
+            self.logger.error(f"Error extracting CC/BCC: {str(e)}", exc_info=True)
         return emails
 
     def _extract_name_from_header_for_email(self, email_message, email_addr: str) -> Optional[str]:
+        """
+        Extract name from email headers for a specific email address.
+        Uses getaddresses() for proper RFC-compliant parsing of CC/BCC.
+        """
         if not email_addr:
             return None
         email_lower = email_addr.lower()
         try:
+            # Check Reply-To
             reply_to = email_message.get('Reply-To', '')
-            if reply_to and email_lower in reply_to.lower():
-                name, addr = parseaddr(reply_to)
-                if name and name != addr:
-                    self.logger.debug(f"✓ Extracted name from Reply-To: {name}")
-                    return name.strip()
+            if reply_to:
+                addresses = getaddresses([reply_to])
+                for name, addr in addresses:
+                    if addr and addr.lower() == email_lower:
+                        if name and name != addr:
+                            self.logger.debug(f"✓ Extracted name from Reply-To: {name}")
+                            return name.strip()
+            
+            # Check Sender
             sender = email_message.get('Sender', '')
-            if sender and email_lower in sender.lower():
-                name, addr = parseaddr(sender)
-                if name and name != addr:
-                    self.logger.debug(f"✓ Extracted name from Sender: {name}")
-                    return name.strip()
+            if sender:
+                addresses = getaddresses([sender])
+                for name, addr in addresses:
+                    if addr and addr.lower() == email_lower:
+                        if name and name != addr:
+                            self.logger.debug(f"✓ Extracted name from Sender: {name}")
+                            return name.strip()
+            
+            # Check From
             from_header = email_message.get('From', '')
-            if from_header and email_lower in from_header.lower():
-                name, addr = parseaddr(from_header)
-                if name and name != addr:
-                    self.logger.debug(f"✓ Extracted name from From: {name}")
-                    return name.strip()
+            if from_header:
+                addresses = getaddresses([from_header])
+                for name, addr in addresses:
+                    if addr and addr.lower() == email_lower:
+                        if name and name != addr:
+                            self.logger.debug(f"✓ Extracted name from From: {name}")
+                            return name.strip()
+            
+            # Check CC - use getaddresses for proper parsing
             cc = email_message.get('Cc', '')
             if cc:
-                for addr_str in cc.split(','):
-                    addr_str = addr_str.strip()
-                    if email_lower in addr_str.lower():
-                        name, addr = parseaddr(addr_str)
+                addresses = getaddresses([cc])
+                for name, addr in addresses:
+                    if addr and addr.lower() == email_lower:
                         if name and name != addr:
                             self.logger.debug(f"✓ Extracted name from CC: {name}")
                             return name.strip()
+            
+            # Check BCC - use getaddresses for proper parsing
             bcc = email_message.get('Bcc', '')
             if bcc:
-                for addr_str in bcc.split(','):
-                    addr_str = addr_str.strip()
-                    if email_lower in addr_str.lower():
-                        name, addr = parseaddr(addr_str)
+                addresses = getaddresses([bcc])
+                for name, addr in addresses:
+                    if addr and addr.lower() == email_lower:
                         if name and name != addr:
                             self.logger.debug(f"✓ Extracted name from BCC: {name}")
                             return name.strip()
         except Exception as e:
-            self.logger.error(f"Error extracting name from header for {email_addr}: {str(e)}")
+            self.logger.error(f"Error extracting name from header for {email_addr}: {str(e)}", exc_info=True)
         return None
 
     def _get_html_body(self, email_message) -> Optional[str]:
@@ -541,6 +641,11 @@ class ContactExtractor:
             return None
 
     def _extract_calendar_email(self, email_message) -> Optional[List[str]]:
+        """
+        Extract emails from calendar invites.
+        Extracts ORGANIZER and ATTENDEE emails from calendar parts,
+        and falls back to headers if no calendar part found.
+        """
         emails = set()
         try:
             if email_message.is_multipart():
@@ -549,17 +654,27 @@ class ContactExtractor:
                         payload = part.get_payload(decode=True).decode("utf-8", errors="ignore")
                         # ORGANIZER
                         for match in re.findall(r"ORGANIZER.*mailto:([^ \r\n]+)", payload, re.IGNORECASE):
-                            emails.add(match.lower())
+                            email_lower = match.lower().strip()
+                            if email_lower and '@' in email_lower:
+                                emails.add(email_lower)
                         # ATTENDEE
                         for match in re.findall(r"ATTENDEE.*mailto:([^ \r\n]+)", payload, re.IGNORECASE):
-                            emails.add(match.lower())
+                            email_lower = match.lower().strip()
+                            if email_lower and '@' in email_lower:
+                                emails.add(email_lower)
+            
+            # Fallback: extract from headers if no calendar part found
             if not emails:
                 for header in ["Sender", "Reply-To", "From"]:
-                    if header in email_message:
-                        _, addr = parseaddr(email_message.get(header))
-                        if addr and "noreply" not in addr.lower():
-                            emails.add(addr.lower())
+                    header_value = email_message.get(header, '')
+                    if header_value:
+                        addresses = getaddresses([header_value])
+                        for name, addr in addresses:
+                            if addr and '@' in addr and "noreply" not in addr.lower():
+                                email_lower = addr.lower().strip()
+                                emails.add(email_lower)
+            
             return list(emails) if emails else None
         except Exception as e:
-            self.logger.error(f"Error extracting calendar emails: {str(e)}")
+            self.logger.error(f"Error extracting calendar emails: {str(e)}", exc_info=True)
             return None

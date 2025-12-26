@@ -28,6 +28,8 @@ class EmailFilter:
         self.sender_rules: List[Dict] = []  # For sender filtering
         self.email_rules: List[Dict] = []  # For extracted email validation
         self.content_rules: List[Dict] = []  # For content scoring
+        self.name_rules: List[Dict] = []  # For name validation
+        self.company_rules: List[Dict] = []  # For company validation
 
         # ML classifier
         self.use_ml = config.get("filters", {}).get("use_ml_classifier", False)
@@ -89,15 +91,21 @@ class EmailFilter:
                 # Separate rules by type
                 if row["category"] in ["recruiter_keywords", "anti_recruiter_keywords"]:
                     self.content_rules.append(rule)
+                elif row["category"].startswith("invalid_name_"):
+                    self.name_rules.append(rule)
+                elif row["category"].startswith("invalid_company_"):
+                    self.company_rules.append(rule)
                 else:
                     # All other rules apply to both sender and extracted emails
                     self.sender_rules.append(rule)
                     self.email_rules.append(rule)
 
             self.logger.info(
-                "Loaded %d sender/email rules, %d content rules from DB",
+                "Loaded %d sender/email rules, %d content rules, %d name rules, %d company rules from DB",
                 len(self.sender_rules),
                 len(self.content_rules),
+                len(self.name_rules),
+                len(self.company_rules),
             )
 
         except Exception as e:
@@ -325,3 +333,77 @@ class EmailFilter:
 
         self.logger.info("Filtered %d emails from %d total", len(filtered), len(emails))
         return filtered
+
+    # --------------------------------------------------
+    # NAME AND COMPANY VALIDATION (DB RULES)
+    # --------------------------------------------------
+    def _check_name_against_db_rules(self, name: str) -> bool:
+        """
+        Check if name is valid using DB rules.
+        Returns True if name should be allowed, False if blocked.
+        """
+        if not name or len(name.strip()) < 2:
+            return False
+        
+        name_lower = name.lower().strip()
+        
+        # Check against invalid name rules
+        for rule in self.name_rules:
+            if self._rule_matches_text(name_lower, rule):
+                self.logger.debug(
+                    f"Name '{name_lower}' blocked by rule: {rule['category']}"
+                )
+                return False
+        
+        return True
+    
+    def _check_company_against_db_rules(self, company: str) -> bool:
+        """
+        Check if company is valid using DB rules.
+        Returns True if company should be allowed, False if blocked.
+        """
+        if not company or len(company.strip()) < 2:
+            return False
+        
+        company_lower = company.lower().strip()
+        
+        # Check against invalid company rules
+        for rule in self.company_rules:
+            if self._rule_matches_text(company_lower, rule):
+                self.logger.debug(
+                    f"Company '{company_lower}' blocked by rule: {rule['category']}"
+                )
+                return False
+        
+        return True
+    
+    def _rule_matches_text(self, text: str, rule: Dict) -> bool:
+        """
+        Check if text matches a rule - handles exact, contains, and regex for text validation.
+        Similar to _rule_matches but for text fields (name, company) instead of emails.
+        """
+        if not text:
+            return False
+        
+        text_lower = text.lower()
+        
+        for kw in rule["keywords"]:
+            if rule["match_type"] == "exact":
+                if isinstance(kw, str) and text_lower == kw:
+                    return True
+            elif rule["match_type"] == "contains":
+                if isinstance(kw, str) and kw in text_lower:
+                    return True
+            elif rule["match_type"] == "regex":
+                if isinstance(kw, re.Pattern):
+                    if kw.search(text_lower):
+                        return True
+                elif isinstance(kw, str):
+                    try:
+                        pattern = re.compile(kw, re.IGNORECASE)
+                        if pattern.search(text_lower):
+                            return True
+                    except re.error:
+                        pass
+        
+        return False
