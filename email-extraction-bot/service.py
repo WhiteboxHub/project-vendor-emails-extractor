@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Email Contact Extractor Service
 
@@ -185,9 +184,19 @@ class EmailExtractionService:
 
                     try:
                         # =====================================================
-                        # PHASE 1: SENDER FILTER (DB PRIORITY RULES)
+                        # PHASE 1 & 2 PREVIEW: EXTRACT CONTENT FOR FILTERING
                         # =====================================================
-                        sender_status = self.email_filter.check_sender(msg)
+                        raw_subject = msg.get("Subject", "")
+                        raw_body = self.cleaner.extract_body(msg)
+                        
+                        clean_subject = self.cleaner.clean_text(raw_subject)
+                        clean_body = self.cleaner.clean_text(raw_body)
+
+                        # =====================================================
+                        # PHASE 1: SENDER FILTER (WITH SMART FALLBACK)
+                        # =====================================================
+                        # Now passing subject/body so we can fallback-allow personal emails with good content
+                        sender_status = self.email_filter.check_sender(msg, clean_subject, clean_body)
                         if sender_status != "allow":
                             continue
 

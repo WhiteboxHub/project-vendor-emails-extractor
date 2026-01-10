@@ -103,18 +103,10 @@ class GLiNERExtractor:
             'job_title': None
         }
         
-        # Blacklist of literal field labels and invalid patterns
-        name_blacklist = {
-            'full name', 'name', 'first name', 'last name', 'middle name',
-            'your name', 'applicant name', 'candidate name', 'recruiter name',
-            'contact name', 'person name', 'fullname', 'firstname', 'lastname'
-        }
-        
-        company_blacklist = {
-            'company', 'organization', 'firm', 'team', 'employer',
-            'company name', 'organization name', 'employer name',
-            'to:', 'from:', 'subject:', 're:', 'fwd:'
-        }
+        # Use CSV-loaded blacklists (NO hardcoding)
+        name_blacklist = self.name_blacklist
+        company_blacklist = self.company_blacklist
+        invalid_patterns = self.invalid_patterns
         
         # Group by label type with scores
         candidates = {

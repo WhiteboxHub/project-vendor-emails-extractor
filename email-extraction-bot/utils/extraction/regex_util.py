@@ -21,6 +21,25 @@ class RegexExtractor:
         
         self.logger = logging.getLogger(__name__)
         self.email_filter = email_filter  # DB-driven filter
+        
+        # Load file extensions from CSV (NO hardcoding)
+        self.file_extensions = self._load_file_extensions()
+    
+    def _load_file_extensions(self) -> set:
+        """Load invalid email file extensions from CSV"""
+        if not self.email_filter or not hasattr(self.email_filter, 'sender_rules'):
+            return set()
+        
+        extensions = set()
+        for rule in self.email_filter.sender_rules:
+            if rule['category'] == 'invalid_email_extension':
+                for kw in rule['keywords']:
+                    if isinstance(kw, str):
+                        extensions.add(kw.lower())
+        
+        if extensions:
+            self.logger.info(f"Loaded {len(extensions)} file extensions from CSV")
+        return extensions
     
     def _is_personal_email(self, email: str) -> bool:
         """
@@ -51,12 +70,12 @@ class RegexExtractor:
         try:
             local_part, domain = email.split('@', 1)
             
-            # Filter out file extensions in local part (image001.png, document.pdf, etc.)
-            file_extensions = ['.png', '.jpg', '.jpeg', '.gif', '.bmp', '.pdf', '.doc', 
-                             '.docx', '.xls', '.xlsx', '.zip', '.rar', '.txt', '.csv']
-            if any(local_part.lower().endswith(ext) for ext in file_extensions):
-                self.logger.debug(f"Filtered out image/file CID: {email}")
-                return False
+            # Use CSV-loaded file extensions (NO hardcoding)
+            if self.file_extensions:
+                for ext in self.file_extensions:
+                    if local_part.lower().endswith(ext):
+                        self.logger.debug(f"Filtered out file/CID: {email}")
+                        return False
             
             # Filter out hex-like domains (CID references like @01dc6e1f.089ef930)
             # These typically have only numbers and hex characters

@@ -7,10 +7,12 @@ from email.utils import parseaddr
 logger = logging.getLogger(__name__)
 
 class SpacyNERExtractor:
-    """Extract entities using Spacy NER"""
+    """Extract entities using Spacy NER - 100% CSV-driven"""
     
-    def __init__(self, model: str = 'en_core_web_sm'):
+    def __init__(self, model: str = 'en_core_web_sm', email_filter=None):
         self.logger = logging.getLogger(__name__)
+        self.email_filter = email_filter  # CSV-driven validation
+        
         try:
             self.nlp = spacy.load(model)
             self.logger.info(f"Loaded Spacy model: {model}")
@@ -18,24 +20,45 @@ class SpacyNERExtractor:
             self.logger.error(f"Spacy model '{model}' not found. Run: python -m spacy download {model}")
             raise
         
-        # Job titles to filter out (should not be extracted as company names)
-        self.job_title_keywords = {
-            # Recruiting roles
-            'recruiter', 'talent acquisition', 'talent specialist', 'headhunter',
-            'staffing', 'sourcer', 'recruitment', 'hiring',
-            # Management titles
-            'manager', 'director', 'lead', 'head', 'chief', 'president', 'vp',
-            'vice president', 'senior', 'junior', 'principal', 'executive',
-            # HR roles
-            'hr', 'human resources', 'people operations', 'people ops',
-            # Technical roles
-            'engineer', 'developer', 'architect', 'designer', 'analyst',
-            'consultant', 'specialist', 'coordinator', 'administrator',
-            # Executive titles
-            'ceo', 'cto', 'cfo', 'coo', 'cmo', 'founder', 'co-founder', 'partner',
-            # Generic roles
-            'associate', 'representative', 'advisor', 'agent', 'officer'
-        }
+        # Load ALL validation from CSV (NO hardcoding)
+        self.job_title_keywords = self._load_csv_keywords('invalid_job_title')
+        self.generic_domains = self._load_csv_keywords('generic_company_domain')
+        self.camelcase_prefixes = self._load_camelcase_prefixes()
+        self.signature_greetings = self._load_csv_keywords('signature_greeting_keywords')
+        
+        if self.email_filter:
+            self.logger.info(
+                f"CSV validation: {len(self.job_title_keywords)} job titles, "
+                f"{len(self.generic_domains)} domains, {len(self.camelcase_prefixes)} prefixes, "
+                f"{len(self.signature_greetings)} greetings"
+            )
+    
+    def _load_csv_keywords(self, category: str) -> set:
+        """Load keywords from CSV by category"""
+        if not self.email_filter or not hasattr(self.email_filter, 'sender_rules'):
+            self.logger.warning(f"No email_filter - {category} disabled")
+            return set()
+        
+        keywords = set()
+        for rule in self.email_filter.sender_rules:
+            if rule['category'] == category:
+                for kw in rule['keywords']:
+                    if isinstance(kw, str):
+                        keywords.add(kw.lower())
+        return keywords
+    
+    def _load_camelcase_prefixes(self) -> dict:
+        """Load CamelCase company prefixes from CSV"""
+        if not self.email_filter or not hasattr(self.email_filter, 'sender_rules'):
+            return {}
+        
+        prefixes = {}
+        for rule in self.email_filter.sender_rules:
+            if rule['category'] == 'camelcase_company_prefix':
+                for kw in rule['keywords']:
+                    if isinstance(kw, str):
+                        prefixes[kw.lower()] = kw.capitalize()
+        return prefixes
     
     def extract_entities(self, text: str) -> Dict[str, str]:
         """
@@ -75,18 +98,26 @@ class SpacyNERExtractor:
             return {'name': None, 'company': None, 'location': None}
     
     def extract_name_from_signature(self, text: str) -> Optional[str]:
-        """Extract name from email signature patterns with better patterns"""
+        """Extract name from email signature patterns - CSV-driven greetings"""
         try:
-            # Enhanced signature patterns
+            # Build dynamic patterns using CSV-loaded greetings
+            if self.signature_greetings:
+                greeting_words = '|'.join(re.escape(g.title()) for g in self.signature_greetings)
+            else:
+                # Minimal fallback if CSV not loaded
+                greeting_words = 'Thanks|Regards|Best|Sincerely'
+            
             patterns = [
-                # After greeting with newline
-                r'(?:Thanks|Regards|Best|Sincerely|Warm regards|Kind regards|Cheers),?\s*[\r\n]+\s*([A-Z][a-z]+(?:[\s-][A-Z][a-z]+){1,2})\s*[\r\n]',
+                # After greeting with newline - enhanced to handle apostrophes and hyphens
+                rf"(?:{greeting_words}),?\s*[\r\n]+\s*([A-Z][a-z]+(?:['-][A-Z]?[a-z]+)*(?:\s+[A-Z][a-z]+(?:['-][A-Z]?[a-z]+)*)" + "{1,2})\\s*[\\r\\n]",
                 # Name followed by title/company
-                r'([A-Z][a-z]+(?:[\s-][A-Z][a-z]+){1,2})\s*[\r\n]+(?:Senior|Lead|Director|Manager|Recruiter|VP|President)',
+                r"([A-Z][a-z]+(?:['-][A-Z]?[a-z]+)*(?:\s+[A-Z][a-z]+(?:['-][A-Z]?[a-z]+)*){1,2})\s*[\r\n]+(?:Senior|Lead|Director|Manager|Recruiter|VP|President|Talent|Staffing)",
                 # Name followed by phone or email on next line
-                r'([A-Z][a-z]+(?:[\s-][A-Z][a-z]+){1,2})\s*[\r\n]+(?:Phone|Mobile|Email|Tel):',
-                # Simple pattern
-                r'(?:Thanks|Regards|Best|Sincerely),?\s*[\r\n]+\s*([A-Z][a-z]+(?:[\s][A-Z][a-z]+){1,2})',
+                r"([A-Z][a-z]+(?:['-][A-Z]?[a-z]+)*(?:\s+[A-Z][a-z]+(?:['-][A-Z]?[a-z]+)*){1,2})\s*[\r\n]+(?:Phone|Mobile|Email|Tel|Cell):",
+                # Simple pattern after greeting
+                rf"(?:{greeting_words}),?\s*[\r\n]+\s*([A-Z][a-z]+(?:['-][A-Z]?[a-z]+)*(?:\s+[A-Z][a-z]+(?:['-][A-Z]?[a-z]+)*)" + "{1,2})",
+                # Mc/Mac names specifically
+                r"([A-Z][a-z]+\s+M[ac]?[A-Z][a-z]+)",
             ]
             
             for pattern in patterns:
@@ -96,7 +127,10 @@ class SpacyNERExtractor:
                     # Validate
                     words = name.split()
                     if 2 <= len(words) <= 3 and not any(c.isdigit() for c in name):
-                        return name
+                        # Additional validation: at least one alphabetic char per word
+                        if all(any(c.isalpha() for c in word) for word in words):
+                            self.logger.debug(f"Extracted name from signature: {name}")
+                            return name
             
             return None
         except Exception as e:
@@ -117,24 +151,20 @@ class SpacyNERExtractor:
             Dictionary with keys: name, company
         """
         try:
-            # Multiple patterns to try (ordered by reliability)
+            result = {'name': None, 'company': None}
+            
+            # Multiple patterns to match different formats
             patterns = [
                 # Pattern 1: HTML tags with Name - Company (hyphen separator)
                 r'<(?:span|div|p|td|th|b|strong)[^>]*>\s*([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})\s*[-–—]\s*([A-Z][a-zA-Z0-9\s&.,]+?)\s*</(?:span|div|p|td|th|b|strong)>',
                 # Pattern 2: HTML tags with Name | Company (pipe separator)
                 r'<(?:span|div|p|td|th|b|strong)[^>]*>\s*([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})\s*\|\s*([A-Z][a-zA-Z0-9\s&.,]+?)\s*</(?:span|div|p|td|th|b|strong)>',
                 # Pattern 3: HTML tags with Name, Company (comma separator)
-                r'<(?:span|div|p|td|th|b|strong)[^>]*>\s*([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})\s*,\s*([A-Z][a-zA-Z0-9\s&.,]+?)\s*</(?:span|div|p|td|th|b|strong)>',
-                # Pattern 4: HTML tags with Name (Company) (parentheses)
-                r'<(?:span|div|p|td|th|b|strong)[^>]*>\s*([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})\s*\(\s*([A-Z][a-zA-Z0-9\s&.,]+?)\s*\)\s*</(?:span|div|p|td|th|b|strong)>',
-                # Pattern 5: Plain text with Name - Company (for text emails)
-                r'(?:^|\n)\s*([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})\s*[-–—]\s*([A-Z][a-zA-Z0-9\s&.,]+?)\s*(?:$|\n)',
-                # Pattern 6: Plain text with Name | Company
-                r'(?:^|\n)\s*([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})\s*\|\s*([A-Z][a-zA-Z0-9\s&.,]+?)\s*(?:$|\n)',
-                # Pattern 7: Name at Company format
-                r'<(?:span|div|p)[^>]*>\s*([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})\s+at\s+([A-Z][a-zA-Z0-9\s&.,]+?)\s*</(?:span|div|p)>',
-                # Pattern 8: Signature-style Name\nCompany (newline separated in HTML)
-                r'<(?:span|div|p|b|strong)[^>]*>\s*([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})\s*</(?:span|div|p|b|strong)>\s*(?:<br\s*/?>|\n)\s*<(?:span|div|p)[^>]*>\s*([A-Z][a-zA-Z0-9\s&.,]+?)\s*</(?:span|div|p)>',
+                r'<(?:span|div|p|td|th|b|strong)[^>]*>\s*([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3}),\s*([A-Z][a-zA-Z0-9\s&.,]+?)\s*</(?:span|div|p|td|th|b|strong)>',
+                # Pattern 4: Name (Company) in parentheses
+                r'<(?:span|div|p|td|th|b|strong)[^>]*>\s*([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})\s*\(([A-Z][a-zA-Z0-9\s&.,]+?)\)\s*</(?:span|div|p|td|th|b|strong)>',
+                # Pattern 5: Plain text Name - Company (no HTML)
+                r'(?:^|\n)\s*([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})\s*[-–—]\s*([A-Z][a-zA-Z0-9\s&.,]+?)(?:\n|$)',
             ]
             
             for pattern in patterns:
@@ -143,21 +173,21 @@ class SpacyNERExtractor:
                     name = match.group(1).strip()
                     company = match.group(2).strip()
                     
-                    # Validate name (2-4 words, no digits, no special chars except space and hyphen)
+                    # Validate name (2-4 words, no digits)
                     name_words = name.split()
                     if 2 <= len(name_words) <= 4 and not any(c.isdigit() for c in name):
-                        # Clean company name
-                        # Remove HTML tags, extra whitespace, trailing punctuation
-                        company = re.sub(r'<[^>]+>', '', company)  # Remove any HTML tags
-                        company = re.sub(r'\s+', ' ', company)      # Normalize whitespace
-                        company = company.strip('.,;: ')
-                        
-                        # Validate company (not empty, not too long, has letters)
-                        if company and 1 < len(company) < 100 and any(c.isalpha() for c in company):
-                            self.logger.info(f"✓ Extracted vendor from pattern: {name} - {company}")
-                            return {'name': name, 'company': company}
+                        result['name'] = name
+                    
+                    # Validate company (not a job title, has letters, not too long)
+                    if company and not self._is_job_title(company):
+                        if any(c.isalpha() for c in company) and len(company) <= 100:
+                            result['company'] = company
+                    
+                    if result['name'] or result['company']:
+                        return result
             
-            return {'name': None, 'company': None}
+            return result
+            
         except Exception as e:
             self.logger.error(f"Error extracting vendor from span: {str(e)}")
             return {'name': None, 'company': None}
@@ -169,66 +199,61 @@ class SpacyNERExtractor:
             if not from_header:
                 return None
             
-            # Parse email header
-            name, email_addr = parseaddr(from_header)
+            # Parse "Name <email@domain.com>" format
+            name, email = parseaddr(from_header)
             
-            # Clean up the name
-            if name:
-                # Remove quotes
-                name = name.strip('"\' ')
+            if name and name != email:
+                # Clean up the name
+                name = name.strip('"\'')
                 
-                # Skip if it's just an email address
-                if '@' in name:
-                    return None
-                
-                # Skip if too short or too long
+                # Validate it looks like a real name
+                # Should be 2-3 words, start with capital, no weird characters
                 words = name.split()
-                if len(words) < 2 or len(words) > 4:
-                    return None
-                
-                # Skip if has numbers (likely username)
-                if any(char.isdigit() for char in name):
-                    return None
-                
-                return name.strip()
+                if 2 <= len(words) <= 3:
+                    # Check if all words start with capital letter
+                    if all(word[0].isupper() for word in words if word):
+                        # Check no digits
+                        if not any(c.isdigit() for c in name):
+                            return name
             
             return None
+            
         except Exception as e:
             self.logger.error(f"Error extracting name from header: {str(e)}")
             return None
     
     def extract_company_from_domain(self, email: str) -> Optional[str]:
-        """Extract and format company name from email domain
+        """Extract and format company name from email domain with smart capitalization
         
         Examples:
-        - john@techcorp.com -> TechCorp
-        - jane@cyber-coders.com -> Cyber Coders
-        - bob@acme-inc.com -> Acme Inc.
+        - john@techcorp.com → TechCorp
+        - jane@cyber-coders.com → Cyber Coders
+        - bob@acme-inc.com → Acme Inc.
+        - alice@123staffing.com → 123 Staffing
+        - eve@cybercoders.com → CyberCoders (smart camelcase detection)
         """
         try:
             if not email or '@' not in email:
                 return None
             
-            # Blacklist of generic domains
-            generic_domains = {
-                'gmail', 'yahoo', 'hotmail', 'outlook', 'protonmail',
-                'icloud', 'aol', 'mail', 'live', 'msn'
-            }
-            
+            # Use CSV-loaded generic domains (NO hardcoding)
             domain = email.split('@')[1]
             company_name = domain.split('.')[0]
             
-            if company_name.lower() in generic_domains:
+            if company_name.lower() in self.generic_domains:
                 return None
             
-            # Replace hyphens and underscores with spaces
-            company_name = company_name.replace('-', ' ').replace('_', ' ')
-            
-            # Title case each word
-            company_name = ' '.join(word.capitalize() for word in company_name.split())
+            # Smart capitalization logic
+            company_name = self._smart_capitalize_company(company_name)
             
             # Clean up with standard cleaning
             company_name = self._clean_company_name(company_name)
+            
+            if company_name and len(company_name) >= 2:
+                self.logger.debug(f"Extracted company from domain: {company_name}")
+                return company_name
+            
+            return None
             
         except Exception as e:
             self.logger.error(f"Error extracting company from domain: {str(e)}")
@@ -241,10 +266,9 @@ class SpacyNERExtractor:
         
         text_lower = text.lower()
         
-        # Check if any job title keyword appears in the text
+        # Check against CSV-loaded job title keywords
         for keyword in self.job_title_keywords:
             if keyword in text_lower:
-                self.logger.debug(f"Rejected job title as company: {text}")
                 return True
         
         return False
@@ -258,72 +282,90 @@ class SpacyNERExtractor:
         TechCorp Inc.
         """
         try:
-            # Look for company-like text after job title in signature
-            lines = text.split('\n')
+            lines = [line.strip() for line in text.split('\n') if line.strip()]
             
+            # Look for company name (usually 2-3 lines after name/title)
             for i, line in enumerate(lines):
-                line_clean = line.strip()
-                
-                # If this line looks like a job title, next line might be company
-                if self._is_job_title(line_clean) and i + 1 < len(lines):
-                    potential_company = lines[i + 1].strip()
+                # Check if this line looks like a job title
+                if self._is_job_title(line) and i + 1 < len(lines):
+                    # Next line might be company
+                    potential_company = lines[i + 1]
                     
-                    # Validate it looks like a company
+                    # Validate it looks like a company name
                     if self._is_valid_company_name(potential_company):
-                        return self._clean_company_name(potential_company)
+                        return potential_company
             
             return None
+            
         except Exception as e:
             self.logger.error(f"Error extracting company from signature: {str(e)}")
             return None
     
     def _is_valid_company_name(self, text: str) -> bool:
         """Validate if text looks like a company name"""
-        if not text or len(text) < 2:
+        if not text:
             return False
         
-        # Must start with capital letter or number
-        if not (text[0].isupper() or text[0].isdigit()):
-            return False
-        
-        # Must not be a job title
-        if self._is_job_title(text):
-            return False
-        
-        # Must have at least some letters
+        # Should have letters
         if not any(c.isalpha() for c in text):
             return False
         
-        # Not too long (no company name should be > 100 chars)
+        # Should not be a job title
+        if self._is_job_title(text):
+            return False
+        
+        # Should not be too long
         if len(text) > 100:
+            return False
+        
+        # Should not be too short
+        if len(text) < 2:
             return False
         
         return True
     
-    def _clean_company_name(self, company: str) -> str:
+    def _clean_company_name(self, company: str) -> Optional[str]:
         """Clean and standardize company name"""
         if not company:
-            return company
+            return None
+        
+        # Remove common suffixes/prefixes
+        company = company.strip()
+        
+        # Remove trailing punctuation
+        company = company.rstrip('.,;:!?')
         
         # Remove extra whitespace
         company = ' '.join(company.split())
         
-        # Remove trailing punctuation (but keep . for Inc., LLC., etc.)
-        company = company.rstrip(',;: ')
+        return company if company else None
+    
+    def _smart_capitalize_company(self, name: str) -> str:
+        """Smart capitalization for company names (CSV-driven)"""
+        if not name:
+            return name
         
-        # Standardize common suffixes
-        suffixes = {
-            ' inc': ' Inc.',
-            ' llc': ' LLC',
-            ' corp': ' Corp.',
-            ' ltd': ' Ltd.',
-            ' co': ' Co.'
-        }
+        # Replace separators with spaces
+        name = name.replace('-', ' ').replace('_', ' ')
         
-        company_lower = company.lower()
-        for old, new in suffixes.items():
-            if company_lower.endswith(old):
-                company = company[:-len(old)] + new
-                break
+        # If it has numbers at the start, separate them
+        if name[0].isdigit():
+            for i, char in enumerate(name):
+                if char.isalpha():
+                    name = name[:i] + ' ' + name[i:]
+                    break
         
-        return company
+        # Use CSV-loaded CamelCase prefixes
+        name_lower = name.lower()
+        for prefix, replacement in self.camelcase_prefixes.items():
+            if name_lower.startswith(prefix) and len(name_lower) > len(prefix):
+                rest = name_lower[len(prefix):]
+                if rest and rest[0].isalpha():
+                    name = replacement + ' ' + rest.capitalize()
+                    break
+        
+        # Standard title case for each word
+        words = name.split()
+        name = ' '.join(word.capitalize() for word in words if word)
+        
+        return name

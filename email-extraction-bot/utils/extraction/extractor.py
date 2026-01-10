@@ -29,14 +29,14 @@ class ContactExtractor:
         if 'spacy' in enabled_methods:
             try:
                 spacy_model = config.get('spacy', {}).get('model', 'en_core_web_sm')
-                self.spacy_extractor = SpacyNERExtractor(model=spacy_model)
+                self.spacy_extractor = SpacyNERExtractor(model=spacy_model, email_filter=email_filter)
                 self.logger.info("Spacy NER extractor initialized")
             except Exception as e:
                 self.logger.warning(f"Failed to load Spacy: {str(e)}")
 
         if 'gliner' in enabled_methods:
             try:
-                self.gliner_extractor = GLiNERExtractor(config)
+                self.gliner_extractor = GLiNERExtractor(config, email_filter=email_filter)
                 self.logger.info("GLiNER extractor initialized")
             except Exception as e:
                 self.logger.warning(f"Failed to load GLiNER: {str(e)}")

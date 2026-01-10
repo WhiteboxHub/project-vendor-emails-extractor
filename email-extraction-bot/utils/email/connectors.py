@@ -127,7 +127,7 @@ class GmailIMAPConnector:
         """
         try:
             status, data = self.connection.uid('fetch', uid, '(RFC822)')
-            if status == 'OK':
+            if status == 'OK': 
                 return data[0][1]
             return None
             

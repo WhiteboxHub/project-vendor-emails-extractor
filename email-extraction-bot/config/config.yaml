@@ -60,6 +60,9 @@ extraction:
 
 # Filtering Configuration
 filters:
+  source: 'csv'  # Options: 'db' or 'csv'
+  csv_path: 'keywords.csv'
+  personal_email_fallback: true  # Allow personal emails if they have strong recruiter keywords
   use_ml_classifier: true
   ml_model_dir: ../models
   

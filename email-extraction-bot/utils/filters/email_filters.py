@@ -43,10 +43,59 @@ class EmailFilter:
             self._load_ml_model()
 
     # --------------------------------------------------
-    # DB RULE LOADING
+    # RULE LOADING
     # --------------------------------------------------
     def _load_rules_from_db(self):
-        """Load all rules from database - NO HARDCODED VALUES"""
+        """Load rules based on configuration (CSV or DB)"""
+        source = self.config.get("filters", {}).get("source", "db")
+        
+        if source == "csv":
+            self._load_rules_from_csv()
+        else:
+             self._load_rules_from_database()
+
+    def _load_rules_from_csv(self):
+        """Load rules from CSV file"""
+        csv_path = self.config.get("filters", {}).get("csv_path", "keywords.csv")
+        try:
+            import csv
+            
+            # handle relative paths
+            if not os.path.isabs(csv_path):
+                 # Try to find it relative to project root or current dir
+                 possible_paths = [
+                     csv_path,
+                     os.path.join(os.path.dirname(__file__), "../../../", csv_path),
+                     os.path.join(os.path.dirname(__file__), "../../", csv_path)
+                 ]
+                 for p in possible_paths:
+                     if os.path.exists(p):
+                         csv_path = p
+                         break
+            
+            self.logger.info(f"Loading rules from CSV: {csv_path}")
+            
+            if not os.path.exists(csv_path):
+                self.logger.error(f"CSV file not found: {csv_path}")
+                return
+
+            with open(csv_path, 'r', encoding='utf-8-sig') as f:
+                reader = csv.DictReader(f)
+                # Normalize headers to lowercase to handle case variations
+                rows = []
+                for row in reader:
+                    # Skip None/empty keys and normalize valid keys to lowercase
+                    normalized_row = {k.lower(): v for k, v in row.items() if k}
+                    rows.append(normalized_row)
+
+            self._process_loaded_rules(rows)
+            
+        except Exception as e:
+            self.logger.error(f"Failed to load CSV rules: {e}")
+            raise
+
+    def _load_rules_from_database(self):
+        """Load rules from database"""
         try:
             conn = mysql.connector.connect(**self.db_config)
             cursor = conn.cursor(dictionary=True)
@@ -65,52 +114,70 @@ class EmailFilter:
             cursor.close()
             conn.close()
 
-            for row in rows:
-                keywords = [
-                    k.strip().lower() for k in row["keywords"].split(",") if k.strip()
-                ]
-
-                # Compile regex if needed
-                if row["match_type"] == "regex":
-                    try:
-                        keywords = [re.compile(k, re.IGNORECASE) for k in keywords]
-                    except re.error as e:
-                        self.logger.warning(f"Invalid regex in {row['category']}: {e}")
-                        continue
-
-                rule = {
-                    "category": row["category"],
-                    "match_type": row["match_type"],
-                    "action": row["action"],
-                    "priority": row["priority"],
-                    "keywords": keywords,
-                    "weight": row["weight"],
-                    "target": row["target"],
-                }
-
-                # Separate rules by type
-                if row["category"] in ["recruiter_keywords", "anti_recruiter_keywords"]:
-                    self.content_rules.append(rule)
-                elif row["category"].startswith("invalid_name_"):
-                    self.name_rules.append(rule)
-                elif row["category"].startswith("invalid_company_"):
-                    self.company_rules.append(rule)
-                else:
-                    # All other rules apply to both sender and extracted emails
-                    self.sender_rules.append(rule)
-                    self.email_rules.append(rule)
-
-            self.logger.info(
-                "Loaded %d sender/email rules, %d content rules, %d name rules, %d company rules from DB",
-                len(self.sender_rules),
-                len(self.content_rules),
-                len(self.name_rules),
-                len(self.company_rules),
-            )
+            self._process_loaded_rules(rows)
 
         except Exception as e:
             self.logger.error(f"Failed to load DB rules: {e}")
             raise
+
+    def _process_loaded_rules(self, rows):
+        """Process raw rule rows into internal structures"""
+        # Clear existing
+        self.sender_rules = []
+        self.email_rules = []
+        self.content_rules = []
+        self.name_rules = []
+        self.company_rules = []
+        
+        for row in rows:
+            # Handle potential string conversions if coming from CSV
+            weight = int(row.get("weight") or 1)
+            priority = int(row.get("priority") or 100)
+            
+            # Handle keywords (split by comma if string)
+            raw_keywords = row["keywords"] if row["keywords"] else ""
+            keywords = [k.strip().lower() for k in raw_keywords.split(",") if k.strip()]
+
+            # Compile regex if needed
+            if row["match_type"] == "regex":
+                try:
+                    keywords = [re.compile(k, re.IGNORECASE) for k in keywords]
+                except re.error as e:
+                    self.logger.warning(f"Invalid regex in {row['category']}: {e}")
+                    continue
+
+            rule = {
+                "category": row["category"],
+                "match_type": row["match_type"],
+                "action": row["action"],
+                "priority": priority,
+                "keywords": keywords,
+                "weight": weight,
+                "target": row.get("target", "both"),
+            }
+
+            # Separate rules by type
+            if row["category"] in ["recruiter_keywords", "anti_recruiter_keywords"]:
+                self.content_rules.append(rule)
+            elif row["category"].startswith("invalid_name_"):
+                self.name_rules.append(rule)
+            elif row["category"].startswith("invalid_company_"):
+                self.company_rules.append(rule)
+            else:
+                # All other rules apply to both sender and extracted emails
+                self.sender_rules.append(rule)
+                self.email_rules.append(rule)
+
+        # Sort rules by priority (lower number = higher priority)
+        self.sender_rules.sort(key=lambda x: x["priority"])
+        self.email_rules.sort(key=lambda x: x["priority"])
+        
+        self.logger.info(
+            "Loaded rules: %d sender, %d content, %d name, %d company",
+            len(self.sender_rules), len(self.content_rules), 
+            len(self.name_rules), len(self.company_rules)
+        )
+
 
     # --------------------------------------------------
     # ML SUPPORT
@@ -213,10 +280,13 @@ class EmailFilter:
     # --------------------------------------------------
     # SENDER FILTER
     # --------------------------------------------------
-    def check_sender(self, email_data: Dict) -> str:
+    # --------------------------------------------------
+    # SENDER FILTER
+    # --------------------------------------------------
+    def check_sender(self, email_data: Dict, subject: str = "", body: str = "") -> str:
         """
-        Check sender email against DB rules.
-        Returns 'allow' or 'block' based on priority-ordered rules.
+        Check sender email against rules.
+        Includes SMART FALLBACK for personal emails if enabled.
         """
         msg = email_data.get("message") if isinstance(email_data, dict) else email_data
         from_header = msg.get("From", "") if hasattr(msg, "get") else getattr(msg, "From", "")
@@ -225,10 +295,35 @@ class EmailFilter:
         if not email:
             return "block"
 
-        # Process rules in priority order
+        # 1. Check Allowlist & Hard Blocks first
         for rule in self.sender_rules:
+            # If we match a rule
             if self._rule_matches(email, rule):
                 action = rule["action"]
+                category = rule["category"]
+                
+                # SMART FALLBACK LOGIC
+                # If it's a "blocked_personal_domain" but we have fallback enabled
+                if (action == "block" and 
+                    category == "blocked_personal_domain" and 
+                    self.config.get("filters", {}).get("personal_email_fallback", False)):
+                    
+                    # Check content score
+                    score = self.score_content(subject, body)
+                    # Use a higher threshold for personal emails (e.g., must be VERY obvious recruiter)
+                    fallback_threshold = self.config.get("filters", {}).get("content_score_threshold", 2) + 2
+                    
+                    if score >= fallback_threshold:
+                        self.logger.info(
+                            f"⚠️ SMART FALLBACK: Allowed personal email {email} due to high content score ({score})"
+                        )
+                        return "allow"
+                    else:
+                        self.logger.debug(
+                            f"Blocked personal email {email} (score {score} < {fallback_threshold})"
+                        )
+                        return "block"
+
                 self.logger.debug(
                     f"Sender {email} → {action} ({rule['category']}, priority {rule['priority']})"
                 )
