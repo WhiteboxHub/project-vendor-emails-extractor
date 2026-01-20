@@ -2,7 +2,6 @@ from typing import Dict, Optional, List
 import logging
 from email.utils import parseaddr
 import re
-
 from .regex_util import RegexExtractor
 from .ner_util import SpacyNERExtractor
 from .gliner_util import GLiNERExtractor
@@ -21,6 +20,11 @@ class ContactExtractor:
         
         # Initialize filter repository
         self.filter_repo = get_filter_repository()
+        
+        # Load filter lists from CSV (no hardcoded fallbacks)
+        self.greeting_patterns = self._load_greeting_patterns()
+        self.company_indicators = self._load_company_indicators()
+        self.skip_keywords = self._load_skip_keywords()
         
         # Initialize extractors based on config
         enabled_methods = config.get('extraction', {}).get('enabled_methods', ['regex', 'spacy'])
@@ -43,6 +47,51 @@ class ContactExtractor:
                 self.logger.info("GLiNER extractor initialized")
             except Exception as e:
                 self.logger.warning(f"Failed to load GLiNER: {str(e)}")
+    
+    def _load_greeting_patterns(self) -> list:
+        """Load greeting patterns from CSV (no fallback)"""
+        try:
+            keyword_lists = self.filter_repo.get_keyword_lists()
+            if 'greeting_patterns' in keyword_lists:
+                patterns = keyword_lists['greeting_patterns']
+                self.logger.info(f"✓ Loaded {len(patterns)} greeting patterns from CSV")
+                return patterns
+            else:
+                self.logger.error("⚠ greeting_patterns not found in CSV - using empty list")
+                return []
+        except Exception as e:
+            self.logger.error(f"Failed to load greeting patterns from CSV: {str(e)} - using empty list")
+            return []
+    
+    def _load_company_indicators(self) -> list:
+        """Load company indicators from CSV (no fallback)"""
+        try:
+            keyword_lists = self.filter_repo.get_keyword_lists()
+            if 'company_indicators' in keyword_lists:
+                indicators = keyword_lists['company_indicators']
+                self.logger.info(f"✓ Loaded {len(indicators)} company indicators from CSV")
+                return indicators
+            else:
+                self.logger.error("⚠ company_indicators not found in CSV - using empty list")
+                return []
+        except Exception as e:
+            self.logger.error(f"Failed to load company indicators from CSV: {str(e)} - using empty list")
+            return []
+    
+    def _load_skip_keywords(self) -> list:
+        """Load skip keywords from CSV (no fallback)"""
+        try:
+            keyword_lists = self.filter_repo.get_keyword_lists()
+            if 'skip_header_keywords' in keyword_lists:
+                keywords = keyword_lists['skip_header_keywords']
+                self.logger.info(f"✓ Loaded {len(keywords)} skip keywords from CSV")
+                return keywords
+            else:
+                self.logger.error("⚠ skip_header_keywords not found in CSV - using empty list")
+                return []
+        except Exception as e:
+            self.logger.error(f"Failed to load skip keywords from CSV: {str(e)} - using empty list")
+            return []
     
     def extract_contacts(self, email_message, clean_body: str, source_email: str) -> List[Dict]:
         """
@@ -365,21 +414,14 @@ class ContactExtractor:
         
         name_lower = name.lower().strip()
         
-        # Filter common greetings and invalid patterns
-        greeting_patterns = [
-            'dear', 'hi ', 'hello', 'hey', 'greetings',
-            'team', 'sir', 'madam', 'folks', 'all',
-            'recipient', 'candidate', 'applicant'
-        ]
-        
-        for pattern in greeting_patterns:
+        # Filter common greetings and invalid patterns (loaded from CSV)
+        for pattern in self.greeting_patterns:
             if pattern in name_lower or name_lower.startswith(pattern):
                 self.logger.info(f"✗ Rejected greeting/generic name: {name}")
                 return True
         
-        # Reject if name looks like a company/team name (all caps, contains common company words)
-        company_indicators = ['team', 'group', 'department', 'inc', 'llc', 'corp', 'ltd']
-        if any(indicator in name_lower for indicator in company_indicators):
+        # Reject if name looks like a company/team name (loaded from CSV)
+        if any(indicator in name_lower for indicator in self.company_indicators):
             self.logger.info(f"✗ Rejected company/team name: {name}")
             return True
         
@@ -581,11 +623,8 @@ class ContactExtractor:
     
     def _is_valid_header_email(self, email: str) -> bool:
         """Check if header email is valid recruiter email (not automated/system)"""
-        # Skip automated/system emails
-        skip_keywords = ['noreply', 'no-reply', 'donotreply', 'notifications', 
-                        'alerts', 'info', 'support', 'admin', 'system', 'mailer']
-        
-        if any(kw in email for kw in skip_keywords):
+        # Skip automated/system emails (loaded from CSV)
+        if any(kw in email for kw in self.skip_keywords):
             return False
         
         # Note: Personal domains (Gmail, Yahoo, etc.) are filtered by _is_gmail_address

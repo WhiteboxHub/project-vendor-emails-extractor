@@ -1,5 +1,7 @@
 import logging
 import re
+import csv
+from pathlib import Path
 from typing import List, Dict, Optional
 from utils.api_client import get_api_client
 
@@ -14,7 +16,70 @@ class FilterRepository:
         self._filters_by_priority = None
         
     def load_filters(self) -> bool:
-        """Load filters from API and cache them"""
+        """Load filters from CSV first, fallback to API if CSV not available"""
+        # Try CSV first
+        csv_path = Path(__file__).parent.parent.parent / "keywords.csv"
+        
+        if csv_path.exists():
+            try:
+                return self._load_from_csv(csv_path)
+            except Exception as e:
+                self.logger.warning(f"Failed to load from CSV: {str(e)}, falling back to database")
+        else:
+            self.logger.info(f"CSV file not found at {csv_path}, loading from database")
+        
+        # Fallback to database API
+        return self._load_from_database()
+    
+    def _load_from_csv(self, csv_path: Path) -> bool:
+        """Load filters from CSV file"""
+        try:
+            filters = []
+            
+            with open(csv_path, 'r', encoding='utf-8') as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    # Convert is_active to int
+                    is_active = int(row.get('is_active', 1))
+                    
+                    # Only load active filters
+                    if is_active == 1:
+                        filters.append({
+                            'id': int(row.get('id', 0)),
+                            'category': row.get('category', ''),
+                            'source': row.get('source', ''),
+                            'keywords': row.get('keywords', ''),
+                            'match_type': row.get('match_type', 'contains'),
+                            'action': row.get('action', 'block'),
+                            'priority': int(row.get('priority', 999)),
+                            'context': row.get('context', ''),
+                            'is_active': is_active,
+                            'created_at': row.get('created_at', ''),
+                            'updated_at': row.get('updated_at', '')
+                        })
+            
+            self._filters = filters
+            
+            # Sort by priority (lower number = higher priority)
+            self._filters.sort(key=lambda x: x.get('priority', 999))
+            
+            # Group by priority for efficient processing
+            self._filters_by_priority = {}
+            for filter_item in self._filters:
+                priority = filter_item.get('priority', 999)
+                if priority not in self._filters_by_priority:
+                    self._filters_by_priority[priority] = []
+                self._filters_by_priority[priority].append(filter_item)
+            
+            self.logger.info(f"✓ Loaded {len(self._filters)} active filters from CSV: {csv_path}")
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"Failed to load filters from CSV: {str(e)}")
+            raise
+    
+    def _load_from_database(self) -> bool:
+        """Load filters from database API (fallback)"""
         try:
             api_client = get_api_client()
             
@@ -44,7 +109,7 @@ class FilterRepository:
                     self._filters_by_priority[priority] = []
                 self._filters_by_priority[priority].append(filter_item)
             
-            self.logger.info(f"Loaded {len(self._filters)} active filters from database")
+            self.logger.info(f"✓ Loaded {len(self._filters)} active filters from database")
             return True
             
         except Exception as e:

@@ -3,6 +3,7 @@ from typing import Optional, Dict
 import logging
 import re
 from email.utils import parseaddr
+from utils.filters.filter_repository import get_filter_repository
 
 logger = logging.getLogger(__name__)
 
@@ -18,24 +19,63 @@ class SpacyNERExtractor:
             self.logger.error(f"Spacy model '{model}' not found. Run: python -m spacy download {model}")
             raise
         
-        # Job titles to filter out (should not be extracted as company names)
-        self.job_title_keywords = {
-            # Recruiting roles
-            'recruiter', 'talent acquisition', 'talent specialist', 'headhunter',
-            'staffing', 'sourcer', 'recruitment', 'hiring',
-            # Management titles
-            'manager', 'director', 'lead', 'head', 'chief', 'president', 'vp',
-            'vice president', 'senior', 'junior', 'principal', 'executive',
-            # HR roles
-            'hr', 'human resources', 'people operations', 'people ops',
-            # Technical roles
-            'engineer', 'developer', 'architect', 'designer', 'analyst',
-            'consultant', 'specialist', 'coordinator', 'administrator',
-            # Executive titles
-            'ceo', 'cto', 'cfo', 'coo', 'cmo', 'founder', 'co-founder', 'partner',
-            # Generic roles
-            'associate', 'representative', 'advisor', 'agent', 'officer'
-        }
+        
+        # Load filter repository
+        self.filter_repo = get_filter_repository()
+        
+        # Load job titles from CSV (fallback to hardcoded)
+        self.job_title_keywords = self._load_job_title_keywords()
+        
+        # Load company suffix mappings from CSV (fallback to hardcoded)
+        self.company_suffixes = self._load_company_suffixes()
+    
+    def _load_job_title_keywords(self) -> set:
+        """Load job title keywords from filter repository (CSV only - no fallback)"""
+        try:
+            keyword_lists = self.filter_repo.get_keyword_lists()
+            
+            if 'job_title_keywords' in keyword_lists:
+                keywords = keyword_lists['job_title_keywords']
+                # Convert to set and lowercase
+                job_titles = {kw.lower().strip() for kw in keywords}
+                self.logger.info(f"✓ Loaded {len(job_titles)} job title keywords from CSV")
+                return job_titles
+            else:
+                self.logger.error("⚠ job_title_keywords not found in CSV - using empty set")
+                return set()
+                
+        except Exception as e:
+            self.logger.error(f"Failed to load job title keywords from CSV: {str(e)} - using empty set")
+            return set()  # No hardcoded fallback - return empty set
+    
+    def _load_company_suffixes(self) -> dict:
+        """Load company suffix mappings from filter repository (CSV only - no fallback)"""
+        try:
+            keyword_lists = self.filter_repo.get_keyword_lists()
+            
+            if 'company_suffix_mapping' in keyword_lists:
+                # Parse suffix mappings from CSV (format: "old|new, old2|new2")
+                mappings_str = keyword_lists['company_suffix_mapping']
+                suffixes = {}
+                
+                for mapping in mappings_str:
+                    if '|' in mapping:
+                        old, new = mapping.split('|', 1)
+                        suffixes[old.strip()] = new.strip()
+                
+                if suffixes:
+                    self.logger.info(f"✓ Loaded {len(suffixes)} company suffix mappings from CSV")
+                    return suffixes
+                else:
+                    self.logger.error("⚠ No valid suffix mappings found in CSV - using empty dict")
+                    return {}
+            else:
+                self.logger.error("⚠ company_suffix_mapping not found in CSV - using empty dict")
+                return {}
+                
+        except Exception as e:
+            self.logger.error(f"Failed to load company suffixes from CSV: {str(e)} - using empty dict")
+            return {}  # No hardcoded fallback - return empty dict
     
     def extract_entities(self, text: str) -> Dict[str, str]:
         """
@@ -209,16 +249,12 @@ class SpacyNERExtractor:
             if not email or '@' not in email:
                 return None
             
-            # Blacklist of generic domains
-            generic_domains = {
-                'gmail', 'yahoo', 'hotmail', 'outlook', 'protonmail',
-                'icloud', 'aol', 'mail', 'live', 'msn'
-            }
             
             domain = email.split('@')[1]
             company_name = domain.split('.')[0]
             
-            if company_name.lower() in generic_domains:
+            # Check if it's a generic/personal domain using filter repository (loaded from CSV)
+            if self.filter_repo.check_email(email) == 'block':
                 return None
             
             # Replace hyphens and underscores with spaces
@@ -311,17 +347,9 @@ class SpacyNERExtractor:
         # Remove trailing punctuation (but keep . for Inc., LLC., etc.)
         company = company.rstrip(',;: ')
         
-        # Standardize common suffixes
-        suffixes = {
-            ' inc': ' Inc.',
-            ' llc': ' LLC',
-            ' corp': ' Corp.',
-            ' ltd': ' Ltd.',
-            ' co': ' Co.'
-        }
-        
+        # Standardize common suffixes (loaded from CSV)
         company_lower = company.lower()
-        for old, new in suffixes.items():
+        for old, new in self.company_suffixes.items():
             if company_lower.endswith(old):
                 company = company[:-len(old)] + new
                 break

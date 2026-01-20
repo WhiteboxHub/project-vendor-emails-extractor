@@ -22,6 +22,57 @@ class RegexExtractor:
         
         self.logger = logging.getLogger(__name__)
         self.filter_repo = get_filter_repository()
+        
+        # Load email blacklist prefixes from CSV (fallback to hardcoded)
+        self.blacklist_prefixes = self._load_blacklist_prefixes()
+        
+        # Load file extensions for CID filtering from CSV (fallback to hardcoded)
+        self.file_extensions = self._load_file_extensions()
+    
+    def _load_blacklist_prefixes(self) -> list:
+        """Load email blacklist prefixes from filter repository (CSV only - no fallback)"""
+        try:
+            # Get blocked_automated_prefix and blocked_generic_prefix from CSV
+            keyword_lists = self.filter_repo.get_keyword_lists()
+            
+            prefixes = []
+            for category in ['blocked_automated_prefix', 'blocked_generic_prefix']:
+                if category in keyword_lists:
+                    keywords = keyword_lists[category]
+                    # Extract keywords, handling regex patterns
+                    for kw in keywords:
+                        # Remove regex anchors (^) if present
+                        clean_kw = kw.replace('^', '').replace('@', '')
+                        if clean_kw:  
+                            prefixes.append(clean_kw.lower())
+            
+            if prefixes:
+                self.logger.info(f"✓ Loaded {len(prefixes)} email blacklist prefixes from CSV")
+            else:
+                self.logger.error("⚠ No email blacklist prefixes found in CSV - using empty list")
+            
+            return prefixes
+                
+        except Exception as e:
+            self.logger.error(f"Failed to load blacklist prefixes from CSV: {str(e)} - using empty list")
+            return []  # No hardcoded fallback - return empty list
+    
+    def _load_file_extensions(self) -> list:
+        """Load file extensions for CID filtering from filter repository (CSV only - no fallback)"""
+        try:
+            keyword_lists = self.filter_repo.get_keyword_lists()
+            
+            if 'blocked_file_extension' in keyword_lists:
+                extensions = keyword_lists['blocked_file_extension']
+                self.logger.info(f"✓ Loaded {len(extensions)} file extensions from CSV")
+                return extensions
+            else:
+                self.logger.error("⚠ blocked_file_extension not found in CSV - using empty list")
+                return []
+                
+        except Exception as e:
+            self.logger.error(f"Failed to load file extensions from CSV: {str(e)} - using empty list")
+            return []  # No hardcoded fallback - return empty list
     
     def _is_personal_email(self, email: str) -> bool:
         """Check if email is from a personal/consumer domain using database filters"""
@@ -45,10 +96,8 @@ class RegexExtractor:
         try:
             local_part, domain = email.split('@', 1)
             
-            # Filter out file extensions in local part (image001.png, document.pdf, etc.)
-            file_extensions = ['.png', '.jpg', '.jpeg', '.gif', '.bmp', '.pdf', '.doc', 
-                             '.docx', '.xls', '.xlsx', '.zip', '.rar', '.txt', '.csv']
-            if any(local_part.lower().endswith(ext) for ext in file_extensions):
+            # Filter out file extensions in local part (loaded from CSV)
+            if any(local_part.lower().endswith(ext) for ext in self.file_extensions):
                 self.logger.debug(f"Filtered out image/file CID: {email}")
                 return False
             
@@ -81,9 +130,6 @@ class RegexExtractor:
             if not emails:
                 return None
             
-            # Filter out common automated emails
-            blacklist_prefixes = ['noreply', 'no-reply', 'donotreply', 'info', 'support', 
-                                 'admin', 'notifications', 'newsletter', 'mailer']
             
             valid_emails = []
             for email in emails:
@@ -98,8 +144,8 @@ class RegexExtractor:
                     self.logger.debug(f"Skipped personal email: {email_lower}")
                     continue
                 
-                # Skip blacklisted prefixes
-                if any(email_lower.startswith(prefix) for prefix in blacklist_prefixes):
+                # Skip blacklisted prefixes (loaded from CSV)
+                if any(email_lower.startswith(prefix) for prefix in self.blacklist_prefixes):
                     continue
                     
                 valid_emails.append(email_lower)
