@@ -1,4 +1,3 @@
-text
 # Email Contact Extractor
 
 Automated vendor contact extraction from candidate email inboxes with GLiNER-powered NER.
