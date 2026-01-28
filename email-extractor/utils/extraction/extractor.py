@@ -5,6 +5,9 @@ import re
 from .regex_util import RegexExtractor
 from .ner_util import SpacyNERExtractor
 from .gliner_util import GLiNERExtractor
+from .position_extractor import PositionExtractor
+from .location_extractor import LocationExtractor
+from .employment_type_extractor import EmploymentTypeExtractor
 from utils.filters.filter_repository import get_filter_repository
 
 logger = logging.getLogger(__name__)
@@ -32,6 +35,9 @@ class ContactExtractor:
         self.regex_extractor = RegexExtractor()
         self.spacy_extractor = None
         self.gliner_extractor = None
+        self.position_extractor = None
+        self.location_extractor = None
+        self.employment_type_extractor = None
         
         if 'spacy' in enabled_methods:
             try:
@@ -47,6 +53,16 @@ class ContactExtractor:
                 self.logger.info("GLiNER extractor initialized")
             except Exception as e:
                 self.logger.warning(f"Failed to load GLiNER: {str(e)}")
+        
+        # Initialize custom extractors
+        try:
+            # Position extractor (uses spacy model if available)
+            spacy_nlp = self.spacy_extractor.nlp if self.spacy_extractor else None
+            self.position_extractor = PositionExtractor(spacy_model=spacy_nlp)
+            self.location_extractor = LocationExtractor()
+            self.logger.info("Position and Location extractors initialized")
+        except Exception as e:
+            self.logger.warning(f"Failed to load Position/Location extractors: {str(e)}")
     
     def _load_greeting_patterns(self) -> list:
         """Load greeting patterns from CSV (no fallback)"""
@@ -93,7 +109,7 @@ class ContactExtractor:
             self.logger.error(f"Failed to load skip keywords from CSV: {str(e)} - using empty list")
             return []
     
-    def extract_contacts(self, email_message, clean_body: str, source_email: str) -> List[Dict]:
+    def extract_contacts(self, email_message, clean_body: str, source_email: str, subject: str = None) -> List[Dict]:
         """
         Extract contact information with fallback chain - returns LIST of contacts
         
@@ -101,6 +117,7 @@ class ContactExtractor:
             email_message: Email message object
             clean_body: Cleaned email body text
             source_email: Source candidate email
+            subject: Email subject line (optional, for better job position extraction)
             
         Returns:
             List of dictionaries with extracted contact fields (can be multiple contacts per email)
@@ -175,6 +192,9 @@ class ContactExtractor:
                     'company': None,
                     'linkedin_id': None,
                     'location': None,
+                    'job_position': None,
+                    'zip_code': None,
+                    'employment_type': None,  # NEW: W2, C2C, Contract, etc.
                     'source': source_email,
                     'extraction_source': source  # Track where email came from
                 }
@@ -215,8 +235,24 @@ class ContactExtractor:
                     contact['company'] = self._extract_field('company', clean_body, email_message, 
                                                              email=contact['email'])
                 
-                # Extract location
-                contact['location'] = self._extract_field('location', clean_body, email_message)
+                # Extract location with zip code
+                location_data = self._extract_field('location_with_zip', clean_body, email_message)
+                if location_data and isinstance(location_data, dict):
+                    contact['location'] = location_data.get('location')
+                    contact['zip_code'] = location_data.get('zip_code')
+                else:
+                    # Fallback to basic location extraction
+                    contact['location'] = self._extract_field('location', clean_body, email_message)
+                
+                # Extract job position
+                # Pass subject line for better position extraction
+                contact['job_position'] = self._extract_field('job_position', clean_body, email_message, subject=subject)
+                
+                # Extract employment type (W2, C2C, Contract, etc.)
+                if self.employment_type_extractor:
+                    employment_types = self.employment_type_extractor.extract_employment_types(clean_body, subject)
+                    if employment_types:
+                        contact['employment_type'] = ', '.join(employment_types)
                 
                 # CRITICAL: Cross-validate company and location to prevent conflicts
                 if contact['company'] and contact['location']:
@@ -303,7 +339,9 @@ class ContactExtractor:
             'linkedin_id': ['regex'],
             'name': ['spacy', 'gliner'],
             'company': ['spacy', 'gliner'],
-            'location': ['gliner']
+            'location': ['gliner', 'spacy'],
+            'location_with_zip': ['custom'],  # Use custom location extractor
+            'job_position': ['custom'],  # Use custom position extractor
         }
         
         methods = field_methods.get(field, ['regex'])
@@ -316,6 +354,14 @@ class ContactExtractor:
                     value = self._extract_spacy(field, text, email_message, **kwargs)
                 elif method == 'gliner' and self.gliner_extractor:
                     value = self._extract_gliner(field, text, **kwargs)
+                elif method == 'custom':
+                    # Handle custom extractors
+                    if field == 'job_position':
+                        value = self._extract_job_position(text, **kwargs)
+                    elif field == 'location_with_zip':
+                        value = self._extract_location_with_zip(text, **kwargs)
+                    else:
+                        continue
                 else:
                     continue
                 
@@ -399,6 +445,57 @@ class ContactExtractor:
             return entities.get('job_title')
         
         return None
+    
+    def _extract_job_position(self, text: str, **kwargs) -> Optional[str]:
+        """Extract job position using PositionExtractor"""
+        if not self.position_extractor:
+            return None
+        
+        try:
+            subject = kwargs.get('subject', '')
+            
+            # Try regex first (fast and accurate for common patterns)
+            position = self.position_extractor.extract_job_position_regex(text)
+            if position:
+                self.logger.debug(f"✓ Extracted position (regex): {position}")
+                return position
+            
+            # Try subject line if available
+            if subject:
+                position = self.position_extractor.extract_job_position_regex(subject)
+                if position:
+                    self.logger.debug(f"✓ Extracted position from subject (regex): {position}")
+                    return position
+            
+            # Try spacy noun phrase extraction
+            position = self.position_extractor.extract_job_position_spacy(text)
+            if position:
+                self.logger.debug(f"✓ Extracted position (spacy): {position}")
+                return position
+            
+            return None
+            
+        except Exception as e:
+            self.logger.error(f"Error extracting job position: {str(e)}")
+            return None
+    
+    def _extract_location_with_zip(self, text: str, **kwargs) -> Optional[Dict]:
+        """Extract location with zip code using LocationExtractor"""
+        if not self.location_extractor:
+            return None
+        
+        try:
+            location_data = self.location_extractor.extract_location_with_zip(text)
+            
+            # Only return if we got at least location or zip
+            if location_data.get('location') or location_data.get('zip_code'):
+                return location_data
+            
+            return None
+            
+        except Exception as e:
+            self.logger.error(f"Error extracting location with zip: {str(e)}")
+            return None
     
     def _extract_name_from_email(self, email: str) -> Optional[str]:
         """Extract and format name from email address (local part before @)"""
