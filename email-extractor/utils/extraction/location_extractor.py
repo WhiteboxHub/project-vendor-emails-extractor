@@ -1,15 +1,8 @@
-"""
-Location Extractor - Extract locations and zip codes from recruiter emails
-
-This module provides methods for extracting:
-1. Locations (city, state)
-2. Zip/postal codes (US, Canada, UK)
-3. Combined location with zip parsing
-"""
 
 import re
 import logging
 from typing import Optional, Dict, List
+from utils.filters.filter_repository import get_filter_repository
 
 logger = logging.getLogger(__name__)
 
@@ -19,6 +12,38 @@ class LocationExtractor:
     
     def __init__(self):
         self.logger = logging.getLogger(__name__)
+        
+        # Initialize these before loading from CSV
+        self.us_states = set()
+        self.state_name_to_abbr = {}
+        self.street_name_indicators = set()
+        
+        # Common phrases that are NOT city names (semantic validation)
+        self.common_phrases = {
+            'thank you', 'kind regards', 'best regards', 'sincerely',
+            'regards', 'thanks', 'cheers', 'yours', 'respectfully',
+            'cordially', 'warmly', 'looking forward'
+        }
+        
+        # Common verbs/adjectives that are NOT city names
+        self.common_verbs_adjectives = {
+            'growing', 'managing', 'leading', 'developing', 'building',
+            'creating', 'designing', 'testing', 'working', 'including',
+            'ensuring', 'providing', 'supporting', 'maintaining'
+        }
+        
+        # Technology terms that are NOT city names
+        self.tech_terms = {
+            'sql', 'api', 'aws', 'gcp', 'azure', 'cloud', 'java',
+            'python', 'react', 'node', 'docker', 'kubernetes'
+        }
+        
+        # Conjunctions/prepositions that shouldn't start city names
+        self.invalid_prefixes = {'or', 'and', 'for', 'with', 'from', 'to'}
+        
+        # Load filter repository for CSV-driven configuration
+        self.filter_repo = get_filter_repository()
+        self._load_location_filters()
         
         # US ZIP code patterns
         self.us_zip_pattern = re.compile(
@@ -37,53 +62,100 @@ class LocationExtractor:
             re.IGNORECASE
         )
         
-        # Location patterns (City, State ZIP)
+        # Location patterns (City, State ZIP) - STRICT with word boundaries
+        # Pattern explanation:
+        # \b - Word boundary (prevents "Or Dallas", "Lo Alto")
+        # [A-Z][a-z]+ - Proper capitalization (prevents "SQL", "ID", "THANK")
+        # (?:\s+[A-Z][a-z]+)* - Multi-word cities (Palo Alto, Santa Clara)
+        # {3,30} - Length validation (prevents single letters and very long phrases)
         self.location_patterns = [
-            # "City, ST 12345" or "City, State 12345"
-            r'([A-Z][a-zA-Z\s]+),\s*([A-Z]{2}|\b(?:Alabama|Alaska|Arizona|Arkansas|California|Colorado|Connecticut|Delaware|Florida|Georgia|Hawaii|Idaho|Illinois|Indiana|Iowa|Kansas|Kentucky|Louisiana|Maine|Maryland|Massachusetts|Michigan|Minnesota|Mississippi|Missouri|Montana|Nebraska|Nevada|New Hampshire|New Jersey|New Mexico|New York|North Carolina|North Dakota|Ohio|Oklahoma|Oregon|Pennsylvania|Rhode Island|South Carolina|South Dakota|Tennessee|Texas|Utah|Vermont|Virginia|Washington|West Virginia|Wisconsin|Wyoming)\b)\s*(\d{5}(?:-\d{4})?)?',
+            # "City, ST 12345" - STRICT: proper capitalization, word boundaries
+            r'\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2}),\s*([A-Z]{2})\b(?:\s*(\d{5}(?:-\d{4})?))?',
             
-            # "Location: City, ST" or "Location: City, State"
-            r'(?:Location|City|Based in|Located in):\s*([A-Z][a-zA-Z\s]+),\s*([A-Z]{2}|\b[A-Z][a-z]+(?:\s[A-Z][a-z]+)?)\s*(\d{5}(?:-\d{4})?)?',
-            
-            # "City, ST" (simple format)
-            r'\b([A-Z][a-zA-Z\s]{2,30}),\s*([A-Z]{2})\b',
+            # "Location: City, ST" - STRICT: with keyword prefix
+            r'(?:Location|City|Based in|Located in):\s*([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2}),\s*([A-Z]{2})\b(?:\s*(\d{5}(?:-\d{4})?))?',
         ]
-        
-        # US State abbreviations for validation
-        self.us_states = {
-            'AL', 'AK', 'AZ', 'AR', 'CA', 'CO', 'CT', 'DE', 'FL', 'GA',
-            'HI', 'ID', 'IL', 'IN', 'IA', 'KS', 'KY', 'LA', 'ME', 'MD',
-            'MA', 'MI', 'MN', 'MS', 'MO', 'MT', 'NE', 'NV', 'NH', 'NJ',
-            'NM', 'NY', 'NC', 'ND', 'OH', 'OK', 'OR', 'PA', 'RI', 'SC',
-            'SD', 'TN', 'TX', 'UT', 'VT', 'VA', 'WA', 'WV', 'WI', 'WY', 'DC'
-        }
-        
-        # State name to abbreviation mapping
-        self.state_name_to_abbr = {
-            'alabama': 'AL', 'alaska': 'AK', 'arizona': 'AZ', 'arkansas': 'AR',
-            'california': 'CA', 'colorado': 'CO', 'connecticut': 'CT', 'delaware': 'DE',
-            'florida': 'FL', 'georgia': 'GA', 'hawaii': 'HI', 'idaho': 'ID',
-            'illinois': 'IL', 'indiana': 'IN', 'iowa': 'IA', 'kansas': 'KS',
-            'kentucky': 'KY', 'louisiana': 'LA', 'maine': 'ME', 'maryland': 'MD',
-            'massachusetts': 'MA', 'michigan': 'MI', 'minnesota': 'MN', 'mississippi': 'MS',
-            'missouri': 'MO', 'montana': 'MT', 'nebraska': 'NE', 'nevada': 'NV',
-            'new hampshire': 'NH', 'new jersey': 'NJ', 'new mexico': 'NM', 'new york': 'NY',
-            'north carolina': 'NC', 'north dakota': 'ND', 'ohio': 'OH', 'oklahoma': 'OK',
-            'oregon': 'OR', 'pennsylvania': 'PA', 'rhode island': 'RI', 'south carolina': 'SC',
-            'south dakota': 'SD', 'tennessee': 'TN', 'texas': 'TX', 'utah': 'UT',
-            'vermont': 'VT', 'virginia': 'VA', 'washington': 'WA', 'west virginia': 'WV',
-            'wisconsin': 'WI', 'wyoming': 'WY'
-        }
+    
+    def _load_location_filters(self):
+        """Load location validation filters from CSV"""
+        try:
+            keyword_lists = self.filter_repo.get_keyword_lists()
+            
+            # Load location false positives (junk words)
+            if 'location_false_positives' in keyword_lists:
+                self.location_false_positives = set(
+                    kw.lower().strip() for kw in keyword_lists['location_false_positives']
+                )
+                self.logger.info(f"✓ Loaded {len(self.location_false_positives)} location false positives from CSV")
+            else:
+                self.location_false_positives = set()
+                self.logger.warning("⚠ location_false_positives not found in CSV")
+            
+            # Load US major cities for validation
+            if 'us_major_cities' in keyword_lists:
+                self.us_major_cities = set(
+                    kw.lower().strip() for kw in keyword_lists['us_major_cities']
+                )
+                self.logger.info(f"✓ Loaded {len(self.us_major_cities)} US cities from CSV")
+            else:
+                self.us_major_cities = set()
+                self.logger.warning("⚠ us_major_cities not found in CSV")
+            
+            # Load location junk patterns (regex)
+            if 'location_junk_patterns' in keyword_lists:
+                self.location_junk_patterns = [
+                    re.compile(pattern.strip(), re.IGNORECASE)
+                    for pattern in keyword_lists['location_junk_patterns']
+                ]
+                self.logger.info(f"✓ Loaded {len(self.location_junk_patterns)} location junk patterns from CSV")
+            else:
+                self.location_junk_patterns = []
+                self.logger.warning("⚠ location_junk_patterns not found in CSV")
+            
+            # Load US state abbreviations
+            if 'us_state_abbreviations' in keyword_lists:
+                self.us_states = set(
+                    kw.upper().strip() for kw in keyword_lists['us_state_abbreviations']
+                )
+                self.logger.info(f"✓ Loaded {len(self.us_states)} US state abbreviations from CSV")
+            else:
+                self.us_states = set()
+                self.logger.warning("⚠ us_state_abbreviations not found in CSV")
+            
+            # Load state name to abbreviation mappings (format: "name|abbr")
+            if 'us_state_name_mappings' in keyword_lists:
+                self.state_name_to_abbr = {}
+                for mapping in keyword_lists['us_state_name_mappings']:
+                    if '|' in mapping:
+                        name, abbr = mapping.split('|', 1)
+                        self.state_name_to_abbr[name.lower().strip()] = abbr.upper().strip()
+                self.logger.info(f"✓ Loaded {len(self.state_name_to_abbr)} state name mappings from CSV")
+            else:
+                self.state_name_to_abbr = {}
+                self.logger.warning("⚠ us_state_name_mappings not found in CSV")
+            
+            # Load street name indicators
+            if 'location_name_indicators' in keyword_lists:
+                self.street_name_indicators = set(
+                    kw.lower().strip() for kw in keyword_lists['location_name_indicators']
+                )
+                self.logger.info(f"✓ Loaded {len(self.street_name_indicators)} street name indicators from CSV")
+            else:
+                self.street_name_indicators = set()
+                self.logger.warning("⚠ location_name_indicators not found in CSV")
+                
+        except Exception as e:
+            self.logger.error(f"Failed to load location filters from CSV: {str(e)}")
+            self.location_false_positives = set()
+            self.us_major_cities = set()
+            self.location_junk_patterns = []
+            self.us_states = set()
+            self.state_name_to_abbr = {}
+            self.street_name_indicators = set()
     
     def extract_zip_code(self, text: str) -> Optional[str]:
         """
         Extract ZIP/postal code from text
-        
-        Args:
-            text: Email body text
-            
-        Returns:
-            Extracted zip code or None
         """
         try:
             if not text:
@@ -121,12 +193,6 @@ class LocationExtractor:
     def extract_location_with_zip(self, text: str) -> Dict[str, Optional[str]]:
         """
         Extract location with city, state, and zip code
-        
-        Args:
-            text: Email body text
-            
-        Returns:
-            Dict with keys: location, city, state, zip_code
         """
         result = {
             'location': None,
@@ -170,8 +236,7 @@ class LocationExtractor:
                                 result['state'] = state_normalized
                                 result['zip_code'] = zip_code
                                 
-                                self.logger.debug(f"✓ Extracted location: {location}" + 
-                                                (f" {zip_code}" if zip_code else ""))
+                                self.logger.debug(f"✓ Extracted location: {location}")
                                 return result
             
             # If no structured location found, try to extract zip code separately
@@ -187,12 +252,6 @@ class LocationExtractor:
     def parse_location_components(self, location: str) -> Dict[str, Optional[str]]:
         """
         Parse location string into components
-        
-        Args:
-            location: Location string (e.g., "San Francisco, CA 94105")
-            
-        Returns:
-            Dict with keys: city, state, zip_code
         """
         result = {
             'city': None,
@@ -249,32 +308,100 @@ class LocationExtractor:
         return None
     
     def _clean_city_name(self, city: str) -> Optional[str]:
-        """Clean and validate city name"""
+        """Clean and validate city name with CSV-driven junk filtering and US-only validation"""
         if not city:
             return None
         
         # Remove extra whitespace
         city = ' '.join(city.split())
         
+        # Remove common location prefixes that get captured by regex
+        # "Agent Santa Clara" → "Santa Clara"
+        # "Engineer At Charlotte" → "Charlotte"
+        # "Location Of Concord" → "Concord"
+        location_prefixes = [
+            r'^Agent\s+',
+            r'^Engineer\s+At\s+',
+            r'^Location\s+Of\s+',
+            r'^Onsite\s+In\s+',
+            r'^Based\s+In\s+',
+            r'^Located\s+In\s+',
+            r'^Ca\s+Or\s+',  # "Ca Or Austin" → "Austin"
+            r'^Or\s+',        # "Or Dallas" → "Dallas"
+            r'^And\s+',
+            r'^At\s+',
+            r'^In\s+',
+            r'^Various\s+',   # "Various Product Lines" → reject later
+        ]
+        for prefix_pattern in location_prefixes:
+            city = re.sub(prefix_pattern, '', city, flags=re.IGNORECASE)
+        
         # Title case
         city = city.title()
         
-        # Validate length
-        if len(city) < 2 or len(city) > 50:
+        # Validate length (3-30 chars for city names)
+        if len(city) < 3 or len(city) > 30:
+            self.logger.debug(f"✗ Rejected location: {city} (invalid length: {len(city)})")
             return None
         
         # Must have letters
         if not any(c.isalpha() for c in city):
             return None
         
-        # Filter out common false positives
-        false_positives = [
-            'team', 'department', 'company', 'position', 'role',
-            'email', 'phone', 'contact', 'address', 'street'
-        ]
+        city_lower = city.lower()
         
-        if city.lower() in false_positives:
+        # 0. SEMANTIC VALIDATION - Reject common phrases, verbs, tech terms
+        # Check if entire city name is a common phrase
+        if city_lower in self.common_phrases:
+            self.logger.debug(f"✗ Rejected common phrase: {city}")
             return None
+        
+        # Check if it's a verb/adjective
+        if city_lower in self.common_verbs_adjectives:
+            self.logger.debug(f"✗ Rejected verb/adjective: {city}")
+            return None
+        
+        # Check if it's a technology term
+        if city_lower in self.tech_terms:
+            self.logger.debug(f"✗ Rejected technology term: {city}")
+            return None
+        
+        # Check if starts with invalid prefix (Or, And, For, etc.)
+        first_word = city_lower.split()[0] if ' ' in city_lower else city_lower
+        if first_word in self.invalid_prefixes:
+            self.logger.debug(f"✗ Rejected location starting with '{first_word}': {city}")
+            return None
+        
+        # 1. Check for street name indicators (road, street, avenue, etc.)
+        for indicator in self.street_name_indicators:
+            if indicator in city_lower:
+                self.logger.debug(f"✗ Rejected street name: {city} (contains '{indicator}')")
+                return None
+        
+        # 2. Check against CSV-loaded false positives
+        for fp in self.location_false_positives:
+            if fp in city_lower:
+                self.logger.debug(f"✗ Rejected junk location: {city} (contains '{fp}' from CSV)")
+                return None
+        
+        # 3. Check against junk patterns (sentence fragments, verbs, etc.)
+        for pattern in self.location_junk_patterns:
+            if pattern.search(city_lower):
+                self.logger.debug(f"✗ Rejected junk location: {city} (matches junk pattern)")
+                return None
+        
+        # 4. Reject if it's mostly non-alphabetic
+        alpha_count = sum(c.isalpha() or c.isspace() for c in city)
+        if alpha_count / len(city) < 0.7:
+            self.logger.debug(f"✗ Rejected junk location: {city} (too many non-alpha chars)")
+            return None
+        
+        # 5. US-only validation: Check if city is in major US cities list
+        # This is optional but improves quality - only validate if we have the list
+        if self.us_major_cities:
+            if city_lower not in self.us_major_cities:
+                # Allow if it's a less common city, but log it
+                self.logger.debug(f"⚠ Location not in major US cities list: {city} (may be valid but uncommon)")
         
         return city
     
@@ -286,14 +413,5 @@ class LocationExtractor:
         # Must be 5 digits or 5+4 format
         if not re.match(r'^\d{5}(?:-\d{4})?$', zip_code):
             return False
-        
-        # First digit should be 0-9 (all valid)
-        # But we can add more validation if needed
-        
-        # Avoid common false positives (years, etc.)
-        if zip_code.startswith('19') or zip_code.startswith('20'):
-            # Could be a year, need more context
-            # For now, we'll allow it but with lower confidence
-            pass
         
         return True

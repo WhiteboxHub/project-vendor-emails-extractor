@@ -60,9 +60,10 @@ class ContactExtractor:
             spacy_nlp = self.spacy_extractor.nlp if self.spacy_extractor else None
             self.position_extractor = PositionExtractor(spacy_model=spacy_nlp)
             self.location_extractor = LocationExtractor()
-            self.logger.info("Position and Location extractors initialized")
+            self.employment_type_extractor = EmploymentTypeExtractor()
+            self.logger.info("Position, Location, and Employment Type extractors initialized")
         except Exception as e:
-            self.logger.warning(f"Failed to load Position/Location extractors: {str(e)}")
+            self.logger.warning(f"Failed to load custom extractors: {str(e)}")
     
     def _load_greeting_patterns(self) -> list:
         """Load greeting patterns from CSV (no fallback)"""
@@ -235,6 +236,10 @@ class ContactExtractor:
                     contact['company'] = self._extract_field('company', clean_body, email_message, 
                                                              email=contact['email'])
                 
+                # Fallback: Extract company from email domain if still null
+                if not contact['company'] and contact['email']:
+                    contact['company'] = self._extract_company_from_email(contact['email'])
+                
                 # Extract location with zip code
                 location_data = self._extract_field('location_with_zip', clean_body, email_message)
                 if location_data and isinstance(location_data, dict):
@@ -244,9 +249,17 @@ class ContactExtractor:
                     # Fallback to basic location extraction
                     contact['location'] = self._extract_field('location', clean_body, email_message)
                 
+                # Check if body is encrypted or very short/junk
+                is_junk_body = "[WARNING: MESSAGE ENCRYPTED]" in subject.upper() or len(clean_body.strip()) < 50
+                
                 # Extract job position
                 # Pass subject line for better position extraction
+                # If body is junk, the extractor will naturally rely more on the subject-based regex
                 contact['job_position'] = self._extract_field('job_position', clean_body, email_message, subject=subject)
+                
+                # If still no position and it's a junk body, try a last-ditch attempt on subject ONLY
+                if not contact['job_position'] and is_junk_body:
+                    contact['job_position'] = self._extract_field('job_position', subject, email_message)
                 
                 # Extract employment type (W2, C2C, Contract, etc.)
                 if self.employment_type_extractor:
@@ -454,6 +467,13 @@ class ContactExtractor:
         try:
             subject = kwargs.get('subject', '')
             
+            # CRITICAL: Normalize acronyms in BOTH text and subject BEFORE any extraction
+            # This fixes "I/ML Engineer" → "AI/ML Engineer" for ALL extraction methods
+            if text:
+                text = self.position_extractor._normalize_acronyms_in_text(text)
+            if subject:
+                subject = self.position_extractor._normalize_acronyms_in_text(subject)
+            
             # Try regex first (fast and accurate for common patterns)
             position = self.position_extractor.extract_job_position_regex(text)
             if position:
@@ -521,6 +541,40 @@ class ContactExtractor:
             self.logger.error(f"Error extracting name from email: {str(e)}")
         
         return None
+    
+    def _extract_company_from_email(self, email: str) -> Optional[str]:
+        """Extract company name from email domain as fallback
+        
+        Args:
+            email: Email address (e.g., prakash.k@nityo.com)
+            
+        Returns:
+            Company name (e.g., "Nityo") or None if blocked domain
+        """
+        if not email or '@' not in email:
+            return None
+        
+        try:
+            # Extract domain
+            domain = email.split('@')[1].lower()
+            
+            # Check if domain is blocked (gmail, yahoo, etc.) using filter_repo
+            if self.filter_repo.check_email(email) == 'block':
+                self.logger.debug(f"✗ Blocked personal domain for company extraction: {domain}")
+                return None
+            
+            # Remove TLD (.com, .co, .org, .net, etc.)
+            company_name = domain.split('.')[0]
+            
+            # Capitalize first letter
+            company_name = company_name.capitalize()
+            
+            self.logger.debug(f"✓ Extracted company from email domain: {company_name} (from {email})")
+            return company_name
+            
+        except Exception as e:
+            self.logger.error(f"Error extracting company from email: {str(e)}")
+            return None
     
     def _is_candidate_name(self, name: str, source_email: str) -> bool:
         """Check if extracted name is the candidate's own name (not recruiter)

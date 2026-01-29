@@ -1,12 +1,3 @@
-"""
-Job Position Extractor - Extract job titles/positions from recruiter emails
-
-This module provides multiple methods for extracting job positions:
-1. Regex-based pattern matching
-2. SpaCy noun phrase extraction with trigger words
-3. Confidence scoring and validation
-"""
-
 import re
 import logging
 from typing import Optional, List, Dict
@@ -34,6 +25,10 @@ class PositionExtractor:
         self.filter_repo = get_filter_repository()
         self.job_title_keywords = self._load_job_title_keywords()
         
+        # Load filter repository for CSV-driven configuration
+        self.filter_repo = get_filter_repository()
+        self._load_position_filters()
+        
         # Regex patterns for job position extraction
         self.position_patterns = [
             # "looking for a Senior Java Developer"
@@ -56,36 +51,14 @@ class PositionExtractor:
             
             # Subject line patterns (often just the job title)
             r'^([A-Z][a-zA-Z\s/\-\.]+?(?:Developer|Engineer|Architect|Manager|Analyst|Designer|Consultant|Specialist|Administrator|Coordinator|Lead|Director|Programmer|Tester|Scientist|Researcher))$',
+            
+            # "TCS interview--Senior Java Developer" or "Interview for Senior Java Developer"
+            r'interview(?:--|\s+for\s+)([A-Z][a-zA-Z\s/\-\.]+?(?:Developer|Engineer|Architect|Manager|Analyst|Designer|Consultant|Specialist|Lead))',
         ]
         
-        # Common job title suffixes for validation
-        self.job_title_suffixes = {
-            'developer', 'engineer', 'architect', 'manager', 'analyst', 'designer',
-            'consultant', 'specialist', 'administrator', 'coordinator', 'lead',
-            'director', 'programmer', 'tester', 'scientist', 'researcher', 'officer',
-            'executive', 'associate', 'representative', 'agent', 'advisor'
-        }
-        
-        # Common prefixes to remove
-        self.prefixes_to_remove = [
-            'the ', 'a ', 'an ', 'our ', 'your ', 'this ', 'that ',
-            'position of ', 'role of ', 'job of '
-        ]
-        
-        # Marketing/fluff words to remove
-        self.marketing_words = [
-            'highly skilled', 'highly-skilled', 'innovative', 'experienced',
-            'talented', 'exceptional', 'outstanding', 'expert', 'professional',
-            'qualified', 'certified', 'proven', 'dedicated', 'motivated',
-            'dynamic', 'results-driven', 'results driven', 'top-notch', 'top notch',
-            'world-class', 'world class', 'best-in-class', 'best in class'
-        ]
-        
-        # Common artifacts to remove from end of position
-        self.trailing_artifacts = [
-            'location', 'duration', 'role', 'position', 'opening', 'opportunity',
-            'job', 'vacancy', 'req', 'requirement', 'needed', 'wanted'
-        ]
+        # Common job title suffixes for validation - will be loaded from CSV
+        self.job_title_suffixes = set()
+        self.acronym_capitalizations = {}
     
     def _load_job_title_keywords(self) -> set:
         """Load job title keywords from filter repository (CSV)"""
@@ -105,12 +78,125 @@ class PositionExtractor:
             self.logger.error(f"Failed to load job title keywords from CSV: {str(e)}")
             return set()
     
+    def _load_position_filters(self):
+        """Load position cleaning filters from CSV"""
+        try:
+            keyword_lists = self.filter_repo.get_keyword_lists()
+            
+            # Load marketing/fluff words
+            if 'position_marketing_words' in keyword_lists:
+                self.marketing_words = [
+                    kw.strip() for kw in keyword_lists['position_marketing_words']
+                ]
+                self.logger.info(f"✓ Loaded {len(self.marketing_words)} position marketing words from CSV")
+            else:
+                self.marketing_words = []
+                self.logger.warning("⚠ position_marketing_words not found in CSV")
+            
+            # Load prefixes to remove
+            if 'position_prefixes_remove' in keyword_lists:
+                self.prefixes_to_remove = [
+                    kw.strip() for kw in keyword_lists['position_prefixes_remove']
+                ]
+                self.logger.info(f"✓ Loaded {len(self.prefixes_to_remove)} position prefixes from CSV")
+            else:
+                self.prefixes_to_remove = []
+                self.logger.warning("⚠ position_prefixes_remove not found in CSV")
+            
+            # Load trailing artifacts
+            if 'position_trailing_artifacts' in keyword_lists:
+                self.trailing_artifacts = [
+                    kw.strip() for kw in keyword_lists['position_trailing_artifacts']
+                ]
+                self.logger.info(f"✓ Loaded {len(self.trailing_artifacts)} position trailing artifacts from CSV")
+            else:
+                self.trailing_artifacts = []
+                self.logger.warning("⚠ position_trailing_artifacts not found in CSV")
+            
+            # Load HTML tag patterns
+            if 'html_tag_patterns' in keyword_lists:
+                self.html_patterns = [
+                    re.compile(pattern.strip(), re.IGNORECASE)
+                    for pattern in keyword_lists['html_tag_patterns']
+                ]
+                self.logger.info(f"✓ Loaded {len(self.html_patterns)} HTML tag patterns from CSV")
+            else:
+                # Fallback to basic HTML tag pattern
+                self.html_patterns = [re.compile(r'<[^>]*>', re.IGNORECASE)]
+                self.logger.warning("⚠ html_tag_patterns not found in CSV - using fallback")
+            
+            # Load job title suffixes
+            if 'job_title_suffixes' in keyword_lists:
+                self.job_title_suffixes = set(
+                    kw.lower().strip() for kw in keyword_lists['job_title_suffixes']
+                )
+                self.logger.info(f"✓ Loaded {len(self.job_title_suffixes)} job title suffixes from CSV")
+            else:
+                self.job_title_suffixes = set()
+                self.logger.warning("⚠ job_title_suffixes not found in CSV")
+            
+            # Load acronym capitalizations (format: "ai|AI,ml|ML")
+            if 'acronym_capitalizations' in keyword_lists:
+                self.acronym_capitalizations = {}
+                for mapping in keyword_lists['acronym_capitalizations']:
+                    if '|' in mapping:
+                        lowercase, proper = mapping.split('|', 1)
+                        self.acronym_capitalizations[lowercase.lower().strip()] = proper.strip()
+                self.logger.info(f"✓ Loaded {len(self.acronym_capitalizations)} acronym capitalizations from CSV")
+            else:
+                self.acronym_capitalizations = {}
+                self.logger.warning("⚠ acronym_capitalizations not found in CSV")
+                
+        except Exception as e:
+            self.logger.error(f"Failed to load position filters from CSV: {str(e)}")
+            self.marketing_words = []
+            self.prefixes_to_remove = []
+            self.trailing_artifacts = []
+            self.html_patterns = [re.compile(r'<[^>]*>', re.IGNORECASE)]
+            self.job_title_suffixes = set()
+            self.acronym_capitalizations = {}
+    
+    def _normalize_acronyms_in_text(self, text: str) -> str:
+        """Normalize common acronym patterns BEFORE extraction
+        
+        This fixes issues where regex captures "I/ML" instead of "AI/ML"
+        because it starts matching at the first capital letter 'I'.
+        
+        Args:
+            text: Input text
+            
+        Returns:
+            Text with normalized acronyms
+        """
+        if not text:
+            return text
+        
+        # Common acronym patterns that get truncated
+        # Pattern: word boundary + single letter + slash + acronym
+        acronym_fixes = [
+            (r'\bI/ML\b', 'AI/ML'),
+            (r'\bI/NLP\b', 'AI/NLP'),
+            (r'\bI/LLM\b', 'AI/LLM'),
+            (r'\bI Engineer\b', 'AI Engineer'),
+            (r'\bI Architect\b', 'AI Architect'),
+            (r'\bI Developer\b', 'AI Developer'),
+            (r'\bI Specialist\b', 'AI Specialist'),
+            # Handle "Gen I" → "Gen AI"
+            (r'\bGen I\b', 'Gen AI'),
+            (r'\bGen I/', 'Gen AI/'),
+        ]
+        
+        for pattern, replacement in acronym_fixes:
+            text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
+        
+        return text
+    
     def extract_job_position_regex(self, text: str) -> Optional[str]:
         """
         Extract job position using regex patterns
         
         Args:
-            text: Email body or subject text
+            text: Email body or subject text (already normalized for acronyms)
             
         Returns:
             Extracted job position or None
@@ -118,6 +204,13 @@ class PositionExtractor:
         try:
             if not text:
                 return None
+            
+            # NOTE: Acronym normalization is now done at entry point in extractor.py
+            # No need to normalize here
+            
+            # Clean subject line of prefixes if it's a subject
+            original_text = text
+            text = self._clean_subject_prefixes(text)
             
             # Try each pattern
             for pattern in self.position_patterns:
@@ -258,29 +351,57 @@ class PositionExtractor:
             self.logger.error(f"Error extracting all positions: {str(e)}")
             return positions
     
+    def _clean_subject_prefixes(self, text: str) -> str:
+        """Remove common subject line prefixes like RE:, FW:, and encrypted warnings"""
+        if not text:
+            return text
+            
+        # Remove [WARNING: MESSAGE ENCRYPTED], etc.
+        text = re.sub(r'\[WARNING:\s*MESSAGE\s*ENCRYPTED\]', '', text, flags=re.IGNORECASE)
+        # Remove RE:, FW:, etc.
+        text = re.sub(r'^(?:RE|FW|Fwd|Automatic reply|Out of Office):\s*', '', text, flags=re.IGNORECASE)
+        
+        # Clean extra brackets/punctuation often at start
+        text = re.sub(r'^[\[\]\-\|\s\:\!\?]+', '', text)
+        
+        return text.strip()
+
     def _clean_position(self, position: str) -> str:
-        """Clean and normalize job position text"""
+        """Clean and normalize job position text with CSV-driven filters"""
         if not position:
             return position
         
-        # 1. Strip HTML/XML tags (e.g., <b>, </b>, <B>, </B>)
-        position = re.sub(r'<[^>]+>', '', position)
+        # 1. Strip HTML/XML tags and entities using CSV patterns
+        position = self._strip_html_comprehensive(position)
         
-        # 2. Remove marketing/fluff words
+        # 2. Remove marketing/fluff words (from CSV)
         position_lower = position.lower()
         for fluff in self.marketing_words:
             # Use word boundaries to avoid partial matches
             pattern = r'\b' + re.escape(fluff) + r'\b'
             position = re.sub(pattern, '', position, flags=re.IGNORECASE)
         
-        # 3. Remove common prefixes
+        # 3. Remove common prefixes (from CSV)
         position_lower = position.lower()
         for prefix in self.prefixes_to_remove:
             if position_lower.startswith(prefix):
                 position = position[len(prefix):]
                 position_lower = position.lower()
         
-        # 4. Remove trailing artifacts (location, duration, etc.)
+        # 3.5. Remove additional contextual prefixes
+        # "For AI Engineer" → "AI Engineer"
+        # "Job Description - Golang Engineer" → "Golang Engineer"
+        contextual_prefixes = [
+            r'^For\s+',
+            r'^Job\s+Description\s*[-:]\s*',
+            r'^Job\s+Role\s*[-:]\s*',
+            r'^Position\s*[-:]\s*',
+            r'^Role\s*[-:]\s*',
+        ]
+        for prefix_pattern in contextual_prefixes:
+            position = re.sub(prefix_pattern, '', position, flags=re.IGNORECASE)
+        
+        # 4. Remove trailing artifacts (from CSV)
         for artifact in self.trailing_artifacts:
             # Remove if it's the last word
             pattern = r'\s+' + re.escape(artifact) + r'$'
@@ -295,16 +416,66 @@ class PositionExtractor:
         # 7. Title case
         position = position.title()
         
-        # 8. Handle common abbreviations
+        # 8. Fix acronym capitalization (AI, ML, NLP, etc.)
+        position = self._fix_acronym_capitalization(position)
+        
+        # 9. Handle common abbreviations
         position = position.replace('Sr.', 'Senior')
         position = position.replace('Jr.', 'Junior')
         position = position.replace('Mgr', 'Manager')
         
-        # 9. Fix common patterns
+        # 10. Fix common patterns
         # "And" at the beginning (from removing "Highly Skilled And...")
         position = re.sub(r'^And\s+', '', position, flags=re.IGNORECASE)
         
+        # 11. Remove person names that got included
+        # Pattern: "FirstName LastName Title" → "Title"
+        # If position has 3+ words and first 2 are capitalized names, remove them
+        words = position.split()
+        if len(words) >= 3:
+            # Check if first two words look like names (capitalized, no special chars)
+            if (words[0][0].isupper() and words[0].isalpha() and 
+                words[1][0].isupper() and words[1].isalpha() and
+                len(words[0]) > 2 and len(words[1]) > 2):
+                # Check if remaining words contain job title keywords
+                remaining = ' '.join(words[2:])
+                if any(suffix in remaining.lower() for suffix in ['engineer', 'developer', 'architect', 'manager', 'specialist', 'analyst', 'consultant']):
+                    position = remaining
+                    self.logger.debug(f"✓ Removed person name from position: {' '.join(words[:2])}")
+        
         return position.strip()
+    
+    def _fix_acronym_capitalization(self, text: str) -> str:
+        """Fix capitalization for common acronyms (AI, ML, NLP, etc.) from CSV"""
+        if not text or not self.acronym_capitalizations:
+            return text
+        
+        # Replace each acronym with proper capitalization
+        # Use word boundaries to avoid partial matches
+        for lowercase, proper in self.acronym_capitalizations.items():
+            # Match whole words only
+            pattern = r'\b' + re.escape(lowercase.title()) + r'\b'
+            text = re.sub(pattern, proper, text, flags=re.IGNORECASE)
+        
+        return text
+    
+    def _strip_html_comprehensive(self, text: str) -> str:
+        """Comprehensively strip HTML tags and entities using CSV patterns"""
+        if not text:
+            return text
+        
+        # Apply all HTML patterns from CSV
+        for pattern in self.html_patterns:
+            text = pattern.sub('', text)
+        
+        # Additional cleanup for common HTML entities not in patterns
+        import html
+        text = html.unescape(text)
+        
+        # Remove any remaining angle brackets (malformed tags)
+        text = re.sub(r'[<>]', '', text)
+        
+        return text.strip()
     
     def _is_valid_position(self, position: str) -> bool:
         """Validate if text looks like a job position"""
