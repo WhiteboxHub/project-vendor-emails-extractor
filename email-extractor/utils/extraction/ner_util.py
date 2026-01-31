@@ -494,11 +494,21 @@ class SpacyNERExtractor:
             'upper', 'lower', 'central', 'metro', 'greater'
         ]
         
-        # Check if text contains location indicators
+        # Check if text contains location indicators (WITH WORD BOUNDARIES)
+        # CRITICAL FIX: Use exact word matching for short indicators (like state codes 'ca', 'al')
+        # otherwise 'Sibitalent' matches 'al' and gets rejected.
+        text_words = set(text_clean.split())
         for indicator in location_indicators:
-            if indicator in text_clean:
-                self.logger.debug(f"Rejected location as company: {text} (contains '{indicator}')")
-                return True
+            # For short indicators (len <= 3), require exact match
+            if len(indicator) <= 3:
+                if indicator in text_words:
+                    self.logger.debug(f"Rejected location as company: {text} (exact match '{indicator}')")
+                    return True
+            # For longer patterns ("united states", "california"), allow substring
+            else:
+                if indicator in text_clean:
+                    self.logger.debug(f"Rejected location as company: {text} (contains '{indicator}')")
+                    return True
         
         # Check if it's a common city name pattern (single word, capitalized, common city names)
         common_cities = [
@@ -519,17 +529,10 @@ class SpacyNERExtractor:
             return True
         
         # Pattern: If text is just 1-2 words and looks like a location (all caps or title case, no numbers)
-        words = text_clean.split()
-        if 1 <= len(words) <= 2:
-            # Check if it's all capitalized (common for locations in signatures)
-            if text.isupper() or (text[0].isupper() and all(w[0].isupper() for w in words if w)):
-                # If it doesn't contain common company suffixes, might be location
-                company_suffixes = ['inc', 'llc', 'corp', 'ltd', 'co', 'group', 'solutions', 'services', 'tech', 'systems']
-                if not any(text_lower.endswith(suffix) for suffix in company_suffixes):
-                    # Additional check: if it's a single word and looks like a place name
-                    if len(words) == 1 and len(text) > 3 and text[0].isupper():
-                        self.logger.debug(f"Rejected potential location as company (single word, no company suffix): {text}")
-                        return True
+        # REMOVED AGGRESSIVE CHECK: This was rejecting valid single-word companies (e.g. "Google", "Stripe")
+        # that don't have suffixes. We should rely on the explicit location lists above instead.
+        
+        return False
         
         return False
     
