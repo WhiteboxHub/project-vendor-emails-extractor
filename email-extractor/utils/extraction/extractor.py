@@ -5,6 +5,9 @@ import re
 from .regex_util import RegexExtractor
 from .ner_util import SpacyNERExtractor
 from .gliner_util import GLiNERExtractor
+from .position_extractor import PositionExtractor
+from .location_extractor import LocationExtractor
+from .employment_type_extractor import EmploymentTypeExtractor
 from utils.filters.filter_repository import get_filter_repository
 
 logger = logging.getLogger(__name__)
@@ -32,6 +35,9 @@ class ContactExtractor:
         self.regex_extractor = RegexExtractor()
         self.spacy_extractor = None
         self.gliner_extractor = None
+        self.position_extractor = None
+        self.location_extractor = None
+        self.employment_type_extractor = None
         
         if 'spacy' in enabled_methods:
             try:
@@ -47,6 +53,17 @@ class ContactExtractor:
                 self.logger.info("GLiNER extractor initialized")
             except Exception as e:
                 self.logger.warning(f"Failed to load GLiNER: {str(e)}")
+        
+        # Initialize custom extractors
+        try:
+            # Position extractor (uses spacy model if available)
+            spacy_nlp = self.spacy_extractor.nlp if self.spacy_extractor else None
+            self.position_extractor = PositionExtractor(spacy_model=spacy_nlp)
+            self.location_extractor = LocationExtractor()
+            self.employment_type_extractor = EmploymentTypeExtractor()
+            self.logger.info("Position, Location, and Employment Type extractors initialized")
+        except Exception as e:
+            self.logger.warning(f"Failed to load custom extractors: {str(e)}")
     
     def _load_greeting_patterns(self) -> list:
         """Load greeting patterns from CSV (no fallback)"""
@@ -93,7 +110,7 @@ class ContactExtractor:
             self.logger.error(f"Failed to load skip keywords from CSV: {str(e)} - using empty list")
             return []
     
-    def extract_contacts(self, email_message, clean_body: str, source_email: str) -> List[Dict]:
+    def extract_contacts(self, email_message, clean_body: str, source_email: str, subject: str = None) -> List[Dict]:
         """
         Extract contact information with fallback chain - returns LIST of contacts
         
@@ -101,6 +118,7 @@ class ContactExtractor:
             email_message: Email message object
             clean_body: Cleaned email body text
             source_email: Source candidate email
+            subject: Email subject line (optional, for better job position extraction)
             
         Returns:
             List of dictionaries with extracted contact fields (can be multiple contacts per email)
@@ -122,7 +140,7 @@ class ContactExtractor:
                 vendor_info = self.spacy_extractor.extract_vendor_from_span(raw_html)
             
             # Extract all potential email addresses based on priority
-            # Priority order: Reply-To > Sender > From > CC/BCC > Calendar > Body
+            # Priority order: Reply-To > Sender > From > To > CC/BCC > Calendar > Body
             all_emails = []
             
             # 1. Reply-To (highest priority - direct contact)
@@ -140,20 +158,26 @@ class ContactExtractor:
             if from_email and not self._is_gmail_address(from_email, block_gmail):
                 all_emails.append(('from', from_email))
             
-            # 4. CC/BCC headers (additional contacts)
+            # 4. To header (recipients - may include vendors)
+            to_emails = self._extract_to_recipients(email_message)
+            for to_email in to_emails:
+                if not self._is_gmail_address(to_email, block_gmail):
+                    all_emails.append(('to', to_email))
+            
+            # 5. CC/BCC headers (additional contacts)
             cc_emails = self._extract_cc_bcc_emails(email_message)
             for cc_email in cc_emails:
                 if not self._is_gmail_address(cc_email, block_gmail):
                     all_emails.append(('cc', cc_email))
             
-            # 5. Calendar invite emails
+            # 6. Calendar invite emails
             calendar_emails = self._extract_calendar_email(email_message)
             if calendar_emails:
                 for cal_email in calendar_emails:
                     if not self._is_gmail_address(cal_email, block_gmail):
                         all_emails.append(('calendar', cal_email))
             
-            # 6. Body extraction (lowest priority)
+            # 7. Body extraction (lowest priority)
             body_email = self._extract_field('email', clean_body, email_message)
             if body_email and not self._is_gmail_address(body_email, block_gmail):
                 all_emails.append(('body', body_email))
@@ -175,6 +199,9 @@ class ContactExtractor:
                     'company': None,
                     'linkedin_id': None,
                     'location': None,
+                    'job_position': None,
+                    'zip_code': None,
+                    'employment_type': None,  # NEW: W2, C2C, Contract, etc.
                     'source': source_email,
                     'extraction_source': source  # Track where email came from
                 }
@@ -215,8 +242,106 @@ class ContactExtractor:
                     contact['company'] = self._extract_field('company', clean_body, email_message, 
                                                              email=contact['email'])
                 
-                # Extract location
-                contact['location'] = self._extract_field('location', clean_body, email_message)
+                # Fallback: Extract company from email domain if still null
+                if not contact['company'] and contact['email']:
+                    contact['company'] = self._extract_company_from_email(contact['email'])
+                
+                # CRITICAL FIX: Extract location from SUBJECT FIRST, then body
+                # This ensures we capture locations like "Charlotte, NC" from subject lines
+                location_from_subject = None
+                if subject and self.location_extractor:
+                    # Normalize acronyms in subject
+                    normalized_subject = self.position_extractor._normalize_acronyms_in_text(subject) if self.position_extractor else subject
+                    location_from_subject = self.location_extractor.extract_location_with_zip(normalized_subject)
+                
+                # If we got location from subject, use it (HIGHEST PRIORITY)
+                if location_from_subject and (location_from_subject.get('location') or location_from_subject.get('zip_code')):
+                    contact['location'] = location_from_subject.get('location')
+                    contact['zip_code'] = location_from_subject.get('zip_code')
+                    self.logger.debug(f"✓ Extracted location from SUBJECT: {contact['location']}")
+                else:
+                    # Fallback to body extraction
+                    # Normalize acronyms in body
+                    normalized_body = self.position_extractor._normalize_acronyms_in_text(clean_body) if self.position_extractor else clean_body
+                    location_data = self._extract_field('location_with_zip', normalized_body, email_message)
+                    if location_data and isinstance(location_data, dict):
+                        contact['location'] = location_data.get('location')
+                        contact['zip_code'] = location_data.get('zip_code')
+                    else:
+                        # Fallback to basic location extraction
+                        contact['location'] = self._extract_field('location', normalized_body, email_message)
+                
+                
+                # Check if body is encrypted or very short/junk
+                subject_upper = subject.upper() if subject else ""
+                is_encrypted = any(marker in subject_upper for marker in ["ENCRYPTED", "SECURE MESSAGE", "CONFIDENTIAL"])
+                is_junk_body = len(clean_body.strip()) < 50
+                
+                # For encrypted or junk bodies, extract job position from subject
+                if (is_encrypted or is_junk_body) and subject:
+                    self.logger.debug(f"⚠ Body is encrypted/junk - extracting from subject: {subject[:100]}")
+                    
+                    # Extract position from subject if not already extracted
+                    if not contact['job_position']:
+                        contact['job_position'] = self._extract_field('job_position', subject, email_message=email_message, subject=subject)
+                    
+                    # CRITICAL FIX: Extract employment_type from subject for encrypted emails
+                    if not contact['employment_type'] and self.employment_type_extractor:
+                        # Normalize acronyms in subject before extraction
+                        normalized_subject = self.position_extractor._normalize_acronyms_in_text(subject) if self.position_extractor else subject
+                        contact['employment_type'] = self.employment_type_extractor.extract_employment_type_string(normalized_subject)
+                        if contact['employment_type']:
+                            self.logger.debug(f"✓ Extracted employment_type from SUBJECT: {contact['employment_type']}")
+                    
+                    # CRITICAL FIX: Extract location from subject for encrypted emails (if not already extracted)
+                    if not contact['location'] and self.location_extractor:
+                        # Normalize acronyms in subject
+                        normalized_subject = self.position_extractor._normalize_acronyms_in_text(subject) if self.position_extractor else subject
+                        location_data = self.location_extractor.extract_location_with_zip(normalized_subject)
+                        if location_data and isinstance(location_data, dict):
+                            contact['location'] = location_data.get('location')
+                            contact['zip_code'] = location_data.get('zip_code')
+                            self.logger.debug(f"✓ Extracted location from SUBJECT (encrypted): {contact['location']}")
+                
+                # Validate and clean up extracted data
+                if contact['job_position']:
+                    contact['job_position'] = contact['job_position'].strip()
+                if contact['location']:
+                    contact['location'] = contact['location'].strip()
+                if contact['company']:
+                    contact['company'] = contact['company'].strip()
+                
+                # Extract job position
+                # Pass subject line for better position extraction
+                if not contact['job_position']: # Only extract if not already extracted from subject
+                    contact['job_position'] = self._extract_field('job_position', clean_body, email_message, subject=subject)
+                
+                # If still no position and it's a junk/encrypted body, try a last-ditch attempt on subject ONLY
+                # This block is now mostly redundant due to the new encrypted/junk body handling above,
+                # but kept for any edge cases where the above might not catch it.
+                if not contact['job_position'] and is_junk_body:
+                    contact['job_position'] = self._extract_field('job_position', subject, email_message)
+                
+                # If body is encrypted, many body-based extractions will fail. 
+                # Use subject for location/company/position as much as possible.
+                # This block is now mostly handled by the new encrypted/junk body handling above.
+                # The location part is specifically addressed.
+                if is_encrypted:
+                    if not contact['location']: # Only try if location wasn't extracted from subject already
+                        # Try extracting location from subject
+                        loc_from_sub = self._extract_field('location_with_zip', subject, email_message)
+                        if loc_from_sub and isinstance(loc_from_sub, dict):
+                            contact['location'] = loc_from_sub.get('location')
+                            contact['zip_code'] = loc_from_sub.get('zip_code')
+                    
+                    if not contact['employment_type'] and self.employment_type_extractor:
+                        contact['employment_type'] = ', '.join(self.employment_type_extractor.extract_employment_types("", subject))
+
+                # Extract employment type (W2, C2C, Contract, etc.) if not already set
+                if not contact['employment_type'] and self.employment_type_extractor:
+                    employment_types = self.employment_type_extractor.extract_employment_types(clean_body, subject)
+                    if employment_types:
+                        contact['employment_type'] = ', '.join(employment_types)
                 
                 # CRITICAL: Cross-validate company and location to prevent conflicts
                 if contact['company'] and contact['location']:
@@ -303,7 +428,9 @@ class ContactExtractor:
             'linkedin_id': ['regex'],
             'name': ['spacy', 'gliner'],
             'company': ['spacy', 'gliner'],
-            'location': ['gliner']
+            'location': ['gliner', 'spacy'],
+            'location_with_zip': ['custom'],  # Use custom location extractor
+            'job_position': ['custom'],  # Use custom position extractor
         }
         
         methods = field_methods.get(field, ['regex'])
@@ -316,6 +443,14 @@ class ContactExtractor:
                     value = self._extract_spacy(field, text, email_message, **kwargs)
                 elif method == 'gliner' and self.gliner_extractor:
                     value = self._extract_gliner(field, text, **kwargs)
+                elif method == 'custom':
+                    # Handle custom extractors
+                    if field == 'job_position':
+                        value = self._extract_job_position(text, **kwargs)
+                    elif field == 'location_with_zip':
+                        value = self._extract_location_with_zip(text, **kwargs)
+                    else:
+                        continue
                 else:
                     continue
                 
@@ -400,6 +535,64 @@ class ContactExtractor:
         
         return None
     
+    def _extract_job_position(self, text: str, **kwargs) -> Optional[str]:
+        """Extract job position using PositionExtractor"""
+        if not self.position_extractor:
+            return None
+        
+        try:
+            subject = kwargs.get('subject', '')
+            
+            # CRITICAL: Normalize acronyms in BOTH text and subject BEFORE any extraction
+            # This fixes "I/ML Engineer" → "AI/ML Engineer" for ALL extraction methods
+            if text:
+                text = self.position_extractor._normalize_acronyms_in_text(text)
+            if subject:
+                subject = self.position_extractor._normalize_acronyms_in_text(subject)
+            
+            # Try regex first (fast and accurate for common patterns)
+            position = self.position_extractor.extract_job_position_regex(text)
+            if position:
+                self.logger.debug(f"✓ Extracted position (regex): {position}")
+                return position
+            
+            # Try subject line if available
+            if subject:
+                position = self.position_extractor.extract_job_position_regex(subject)
+                if position:
+                    self.logger.debug(f"✓ Extracted position from subject (regex): {position}")
+                    return position
+            
+            # Try spacy noun phrase extraction
+            position = self.position_extractor.extract_job_position_spacy(text)
+            if position:
+                self.logger.debug(f"✓ Extracted position (spacy): {position}")
+                return position
+            
+            return None
+            
+        except Exception as e:
+            self.logger.error(f"Error extracting job position: {str(e)}")
+            return None
+    
+    def _extract_location_with_zip(self, text: str, **kwargs) -> Optional[Dict]:
+        """Extract location with zip code using LocationExtractor"""
+        if not self.location_extractor:
+            return None
+        
+        try:
+            location_data = self.location_extractor.extract_location_with_zip(text)
+            
+            # Only return if we got at least location or zip
+            if location_data.get('location') or location_data.get('zip_code'):
+                return location_data
+            
+            return None
+            
+        except Exception as e:
+            self.logger.error(f"Error extracting location with zip: {str(e)}")
+            return None
+    
     def _extract_name_from_email(self, email: str) -> Optional[str]:
         """Extract and format name from email address (local part before @)"""
         try:
@@ -424,6 +617,40 @@ class ContactExtractor:
             self.logger.error(f"Error extracting name from email: {str(e)}")
         
         return None
+    
+    def _extract_company_from_email(self, email: str) -> Optional[str]:
+        """Extract company name from email domain as fallback
+        
+        Args:
+            email: Email address (e.g., prakash.k@nityo.com)
+            
+        Returns:
+            Company name (e.g., "Nityo") or None if blocked domain
+        """
+        if not email or '@' not in email:
+            return None
+        
+        try:
+            # Extract domain
+            domain = email.split('@')[1].lower()
+            
+            # Check if domain is blocked (gmail, yahoo, etc.) using filter_repo
+            if self.filter_repo.check_email(email) == 'block':
+                self.logger.debug(f"✗ Blocked personal domain for company extraction: {domain}")
+                return None
+            
+            # Remove TLD (.com, .co, .org, .net, etc.)
+            company_name = domain.split('.')[0]
+            
+            # Capitalize first letter
+            company_name = company_name.capitalize()
+            
+            self.logger.debug(f"✓ Extracted company from email domain: {company_name} (from {email})")
+            return company_name
+            
+        except Exception as e:
+            self.logger.error(f"Error extracting company from email: {str(e)}")
+            return None
     
     def _is_candidate_name(self, name: str, source_email: str) -> bool:
         """Check if extracted name is the candidate's own name (not recruiter)
@@ -611,6 +838,25 @@ class ContactExtractor:
             self.logger.error(f"Error extracting From: {str(e)}")
         return None
     
+    def _extract_to_recipients(self, email_message) -> List[str]:
+        """Extract emails from To header"""
+        emails = []
+        try:
+            to_header = email_message.get('To', '')
+            if to_header:
+                for addr in to_header.split(','):
+                    _, email_addr = parseaddr(addr.strip())
+                    if email_addr and '@' in email_addr:
+                        email_lower = email_addr.lower()
+                        if self._is_valid_header_email(email_lower):
+                            emails.append(email_lower)
+                            self.logger.debug(f"✓ Extracted To: {email_lower}")
+        
+        except Exception as e:
+            self.logger.error(f"Error extracting To: {str(e)}")
+        
+        return emails
+    
     def _extract_cc_bcc_emails(self, email_message) -> List[str]:
         """Extract emails from CC and BCC headers"""
         emails = []
@@ -693,6 +939,17 @@ class ContactExtractor:
                 if name and name != addr:
                     self.logger.debug(f"✓ Extracted name from From: {name}")
                     return name.strip()
+            
+            # Check To header
+            to_header = email_message.get('To', '')
+            if to_header:
+                for addr_str in to_header.split(','):
+                    addr_str = addr_str.strip()
+                    if email_lower in addr_str.lower():
+                        name, addr = parseaddr(addr_str)
+                        if name and name != addr:
+                            self.logger.debug(f"✓ Extracted name from To: {name}")
+                            return name.strip()
             
             # Check CC header
             cc = email_message.get('Cc', '')

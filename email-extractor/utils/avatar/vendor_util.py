@@ -1,5 +1,6 @@
 from typing import List, Dict
 import logging
+import json
 from utils.api_client import APIClient
 
 logger = logging.getLogger(__name__)
@@ -19,7 +20,7 @@ class VendorUtil:
         self.api_client = api_client
         self.logger = logging.getLogger(__name__)
 
-    def save_contacts(self, contacts: List[Dict]) -> int:
+    def save_contacts(self, contacts: List[Dict], candidate_id: int = None) -> int:
         """
         Save extracted contacts via API using BULK insert
         (same API signature, single request)
@@ -117,6 +118,60 @@ class VendorUtil:
             self.logger.info(
                 f"Bulk insert completed | Inserted: {inserted}, Skipped: {skipped}"
             )
+            
+            # --------------------------------------------------
+            # Step 4: Save to raw_position table (SEPARATE API CALL)
+            # --------------------------------------------------
+            if candidate_id:
+                try:
+                    bulk_raw_positions = []
+                    for contact in valid_contacts:
+                        # Construct raw_contact_info as JSON string
+                        contact_info = {
+                            "name": contact.get("name"),
+                            "email": contact.get("email"),
+                            "phone": contact.get("phone"),
+                            "linkedin": contact.get("linkedin_id")
+                        }
+                        
+                        # Build raw_position payload matching the API schema
+                        raw_payload = {
+                            "candidate_id": candidate_id,
+                            "source": "email",
+                            "source_uid": contact.get("extracted_from_uid"),
+                            "extractor_version": "v2.0",
+                            "raw_title": contact.get("job_position"),
+                            "raw_company": contact.get("company"),
+                            "raw_location": contact.get("location"),
+                            "raw_zip": contact.get("zip_code"),
+                            "raw_description": contact.get("raw_body"),
+                            "raw_contact_info": json.dumps(contact_info),
+                            "raw_notes": f"Extracted from {contact.get('extraction_source')}",
+                            "raw_payload": json.dumps(contact),  # Save full extraction payload
+                            "processing_status": "new"
+                        }
+                        bulk_raw_positions.append(raw_payload)
+                    
+                    if bulk_raw_positions:
+                        self.logger.info(f"Sending {len(bulk_raw_positions)} raw positions to /api/raw_position")
+                        
+                        # POST to /api/raw_position (SEPARATE API CALL)
+                        response_raw = self.api_client.post(
+                            "/api/raw_position",
+                            bulk_raw_positions  # Send list directly, not wrapped
+                        )
+                        
+                        if isinstance(response_raw, dict):
+                            inserted_positions = response_raw.get("inserted", 0)
+                            skipped_positions = response_raw.get("skipped", 0)
+                            self.logger.info(f"Raw positions saved: {inserted_positions} inserted, {skipped_positions} skipped")
+                        else:
+                            self.logger.info("Raw positions saved successfully")
+                        
+                except Exception as e:
+                    self.logger.error(f"Error saving raw positions: {str(e)}")
+                    # Do not fail the whole batch if raw position save fails
+                    # Vendor contacts are already saved at this point
 
             return inserted
 

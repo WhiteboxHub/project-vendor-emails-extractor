@@ -194,6 +194,8 @@ class EmailExtractionService:
                             for contact in contacts_list:
                                 # Only save if we have email or linkedin
                                 if contact.get('email') or contact.get('linkedin_id'):
+                                    # Add raw body for raw_position table
+                                    contact['raw_body'] = clean_body
                                     total_contacts.append(contact)
                                     self.logger.debug(f"Extracted contact: {contact.get('email', 'N/A')} from {contact.get('extraction_source', 'unknown')}")
                                 
@@ -213,7 +215,8 @@ class EmailExtractionService:
                 
                 # Save all contacts
                 if total_contacts:
-                    contacts_saved = self.vendor_util.save_contacts(total_contacts)
+                    candidate_id_pk = candidate.get('id')
+                    contacts_saved = self.vendor_util.save_contacts(total_contacts, candidate_id=candidate_id_pk)
                 
                 self.logger.info(f"✓ Completed {email}: {contacts_saved} contacts saved from {filter_stats_aggregated['passed']} filtered emails")
                 

@@ -15,21 +15,25 @@ class CompanyCandidate(TypedDict):
     confidence: float  # 0.0 - 1.0
     type: str  # 'vendor' | 'client' | 'ats' | 'unknown'
 
-# Scoring System (CSV-driven filtering makes this even more effective)
+# Scoring System - PRIORITIZES CLIENT COMPANY (where job is) over VENDOR COMPANY (recruiting agency)
+# Strategy: Extract the company where the POSITION is, not where the recruiter works
 COMPANY_SOURCE_SCORES = {
-    'span': 0.95,      # HTML span tags - highest confidence
-    'domain': 0.90,    # Email domain - very reliable
-    'signature': 0.80, # Email signature - reliable
-    'body_intro': 0.65, # Body introduction - moderate
-    'ner': 0.50       # NER extraction - lowest confidence
+    'client_explicit': 0.95,   # Explicit "client: XYZ" or "end client: ABC" - HIGHEST
+    'span': 0.90,              # HTML span tags - very high confidence
+    'body_client_pattern': 0.85, # "Position at Company" or "role with Company" patterns
+    'signature': 0.75,         # Email signature - reliable but could be vendor
+    'body_intro': 0.60,        # Body introduction - moderate (could be vendor intro)
+    'ner': 0.50,               # NER extraction - moderate confidence
+    'domain': 0.30             # Email domain - LOWEST (usually vendor, not client!)
 }
 
 COMPANY_PENALTIES = {
-    'ats_domain': -0.40,      # ATS platform detected
-    'contains_client': -0.50, # Client language detected
-    'generic_term': -0.30,    # Generic company terms
-    'too_short': -0.20,       # Company name too short
-    'is_location': -0.60      # Location detected (strong penalty to reject)
+    'ats_domain': -0.40,       # ATS platform detected
+    'contains_client': -0.50,  # Client language detected (paradoxically means it's NOT the client)
+    'generic_term': -0.30,     # Generic company terms
+    'too_short': -0.20,        # Company name too short
+    'is_location': -0.60,      # Location detected (strong penalty to reject)
+    'is_vendor_domain': -0.50  # NEW: Domain is from vendor email (not client company)
 }
 
 MIN_COMPANY_SCORE = 0.70  # Minimum score to accept candidate
@@ -343,6 +347,18 @@ class SpacyNERExtractor:
             score += COMPANY_PENALTIES['too_short']
             self.logger.debug(f"Penalty: Too short ({name})")
         
+        # BONUS: Company has common business suffix (Inc, LLC, Corp, Ltd, etc.)
+        company_suffixes = ['inc', 'llc', 'corp', 'ltd', 'limited', 'corporation', 'incorporated', 'co', 'company', 'group', 'solutions', 'services', 'technologies', 'tech', 'systems']
+        if any(name.lower().endswith(suffix) or f' {suffix}' in name.lower() for suffix in company_suffixes):
+            score += 0.10
+            self.logger.debug(f"Bonus: Company suffix detected ({name})")
+        
+        # BONUS: Contains vendor indicators (staffing, recruiting, solutions, etc.)
+        if self.vendor_indicators and any(indicator in name.lower() for indicator in self.vendor_indicators):
+            score += 0.05
+            candidate['type'] = 'vendor'
+            self.logger.debug(f"Bonus: Vendor indicator detected ({name})")
+        
         return max(0.0, min(1.0, score))  # Clamp between 0 and 1
     
     def extract_name_from_header(self, email_message) -> Optional[str]:
@@ -478,11 +494,21 @@ class SpacyNERExtractor:
             'upper', 'lower', 'central', 'metro', 'greater'
         ]
         
-        # Check if text contains location indicators
+        # Check if text contains location indicators (WITH WORD BOUNDARIES)
+        # CRITICAL FIX: Use exact word matching for short indicators (like state codes 'ca', 'al')
+        # otherwise 'Sibitalent' matches 'al' and gets rejected.
+        text_words = set(text_clean.split())
         for indicator in location_indicators:
-            if indicator in text_clean:
-                self.logger.debug(f"Rejected location as company: {text} (contains '{indicator}')")
-                return True
+            # For short indicators (len <= 3), require exact match
+            if len(indicator) <= 3:
+                if indicator in text_words:
+                    self.logger.debug(f"Rejected location as company: {text} (exact match '{indicator}')")
+                    return True
+            # For longer patterns ("united states", "california"), allow substring
+            else:
+                if indicator in text_clean:
+                    self.logger.debug(f"Rejected location as company: {text} (contains '{indicator}')")
+                    return True
         
         # Check if it's a common city name pattern (single word, capitalized, common city names)
         common_cities = [
@@ -503,17 +529,10 @@ class SpacyNERExtractor:
             return True
         
         # Pattern: If text is just 1-2 words and looks like a location (all caps or title case, no numbers)
-        words = text_clean.split()
-        if 1 <= len(words) <= 2:
-            # Check if it's all capitalized (common for locations in signatures)
-            if text.isupper() or (text[0].isupper() and all(w[0].isupper() for w in words if w)):
-                # If it doesn't contain common company suffixes, might be location
-                company_suffixes = ['inc', 'llc', 'corp', 'ltd', 'co', 'group', 'solutions', 'services', 'tech', 'systems']
-                if not any(text_lower.endswith(suffix) for suffix in company_suffixes):
-                    # Additional check: if it's a single word and looks like a place name
-                    if len(words) == 1 and len(text) > 3 and text[0].isupper():
-                        self.logger.debug(f"Rejected potential location as company (single word, no company suffix): {text}")
-                        return True
+        # REMOVED AGGRESSIVE CHECK: This was rejecting valid single-word companies (e.g. "Google", "Stripe")
+        # that don't have suffixes. We should rely on the explicit location lists above instead.
+        
+        return False
         
         return False
     
@@ -543,6 +562,150 @@ class SpacyNERExtractor:
             return None
         except Exception as e:
             self.logger.error(f"Error extracting company from signature: {str(e)}")
+            return None
+    
+    def extract_company_from_body_intro(self, text: str) -> Optional[str]:
+        """Extract company name from body introduction patterns
+        
+        Looks for patterns like:
+        - "I'm from XYZ Company"
+        - "I work at ABC Corp"
+        - "I represent TechCorp"
+        - "calling from XYZ Solutions"
+        """
+        try:
+            # Common introduction patterns
+            patterns = [
+                # "I'm from/with/at Company"
+                r"(?:I'?m|I am)\s+(?:from|with|at)\s+([A-Z][a-zA-Z0-9\s&.,'-]+?)(?:\.|,|;|\s+and\s|\s+in\s|\s+for\s|\s+to\s|$)",
+                # "I work for/at/with Company"
+                r"(?:I|We)\s+work\s+(?:for|at|with)\s+([A-Z][a-zA-Z0-9\s&.,'-]+?)(?:\.|,|;|\s+and\s|\s+in\s|\s+for\s|\s+to\s|$)",
+                # "I represent Company"
+                r"(?:I|We)\s+represent\s+([A-Z][a-zA-Z0-9\s&.,'-]+?)(?:\.|,|;|\s+and\s|\s+in\s|\s+for\s|\s+to\s|$)",
+                # "calling from Company"
+                r"calling\s+from\s+([A-Z][a-zA-Z0-9\s&.,'-]+?)(?:\.|,|;|\s+and\s|\s+in\s|\s+for\s|\s+to\s|$)",
+                # "reaching out from Company"
+                r"reaching\s+out\s+from\s+([A-Z][a-zA-Z0-9\s&.,'-]+?)(?:\.|,|;|\s+and\s|\s+in\s|\s+for\s|\s+to\s|$)",
+                # "Name - Title at Company"
+                r"(?:^|\n)\s*[A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3}\s*[-–—]\s*[A-Za-z\s]+\s+at\s+([A-Z][a-zA-Z0-9\s&.,'-]+?)(?:\.|,|;|\s+and\s|\s+in\s|\s+for\s|\s+to\s|\n|$)",
+                # "working with Company"
+                r"working\s+with\s+([A-Z][a-zA-Z0-9\s&.,'-]+?)(?:\.|,|;|\s+and\s|\s+in\s|\s+for\s|\s+to\s|$)",
+                # "on behalf of Company"
+                r"on\s+behalf\s+of\s+([A-Z][a-zA-Z0-9\s&.,'-]+?)(?:\.|,|;|\s+and\s|\s+in\s|\s+for\s|\s+to\s|$)",
+            ]
+            
+            for pattern in patterns:
+                match = re.search(pattern, text, re.MULTILINE | re.IGNORECASE)
+                if match:
+                    potential_company = match.group(1).strip()
+                    
+                    # Clean up the match
+                    potential_company = re.sub(r'\s+', ' ', potential_company)  # Normalize whitespace
+                    potential_company = potential_company.strip('.,;: ')
+                    
+                    # Validate it looks like a company
+                    if self._is_valid_company_name(potential_company):
+                        cleaned = self._clean_company_name(potential_company)
+                        self.logger.debug(f"✓ Extracted company from body intro: {cleaned}")
+                        return cleaned
+            
+            return None
+        except Exception as e:
+            self.logger.error(f"Error extracting company from body intro: {str(e)}")
+            return None
+    
+    def extract_client_company_explicit(self, text: str) -> Optional[str]:
+        """Extract client company from explicit mentions - HIGHEST PRIORITY
+        
+        Looks for explicit client mentions like:
+        - "Client: ABC Corp"
+        - "End Client: XYZ Inc"
+        - "Client Name: TechCorp"
+        - "Our client, ABC Company"
+        - "for our client ABC Corp"
+        """
+        try:
+            # Explicit client patterns (case-insensitive)
+            patterns = [
+                # "Client: Company" or "End Client: Company"
+                r"(?:end\s+)?client\s*:\s*([A-Z][a-zA-Z0-9\s&.,'-]+?)(?:\.|,|;|\s+is\s|\s+has\s|\s+in\s|\n|$)",
+                # "Client Name: Company"
+                r"client\s+name\s*:\s*([A-Z][a-zA-Z0-9\s&.,'-]+?)(?:\.|,|;|\s+is\s|\s+has\s|\s+in\s|\n|$)",
+                # "Our client, Company" or "our client Company"
+                r"our\s+client[,\s]+([A-Z][a-zA-Z0-9\s&.,'-]+?)(?:\.|,|;|\s+is\s|\s+has\s|\s+in\s|\n|$)",
+                # "for our client Company"
+                r"for\s+our\s+client\s+([A-Z][a-zA-Z0-9\s&.,'-]+?)(?:\.|,|;|\s+is\s|\s+has\s|\s+in\s|\n|$)",
+                # "Client Company Name: XYZ"
+                r"client\s+company\s+name\s*:\s*([A-Z][a-zA-Z0-9\s&.,'-]+?)(?:\.|,|;|\s+is\s|\s+has\s|\s+in\s|\n|$)",
+                # "working with client Company"
+                r"working\s+with\s+(?:our\s+)?client\s+([A-Z][a-zA-Z0-9\s&.,'-]+?)(?:\.|,|;|\s+is\s|\s+has\s|\s+in\s|\n|$)",
+                # "Position with [Company]" or "Position at [Company]" (in brackets/parentheses)
+                r"position\s+(?:with|at)\s+\[([A-Z][a-zA-Z0-9\s&.,'-]+?)\]",
+                r"position\s+(?:with|at)\s+\(([A-Z][a-zA-Z0-9\s&.,'-]+?)\)",
+            ]
+            
+            for pattern in patterns:
+                match = re.search(pattern, text, re.MULTILINE | re.IGNORECASE)
+                if match:
+                    potential_company = match.group(1).strip()
+                    
+                    # Clean up the match
+                    potential_company = re.sub(r'\s+', ' ', potential_company)
+                    potential_company = potential_company.strip('.,;: ')
+                    
+                    # Validate it looks like a company
+                    if self._is_valid_company_name(potential_company):
+                        cleaned = self._clean_company_name(potential_company)
+                        self.logger.info(f"✓✓✓ EXPLICIT CLIENT FOUND: {cleaned}")
+                        return cleaned
+            
+            return None
+        except Exception as e:
+            self.logger.error(f"Error extracting explicit client company: {str(e)}")
+            return None
+    
+    def extract_company_from_position_context(self, text: str) -> Optional[str]:
+        """Extract client company from position context patterns
+        
+        Looks for patterns like:
+        - "Java Developer at ABC Corp"
+        - "Senior Engineer with XYZ Inc"
+        - "role at TechCorp"
+        - "position with ABC Company"
+        """
+        try:
+            # Position context patterns
+            patterns = [
+                # "Position/Role/Job at Company"
+                r"(?:position|role|job|opportunity)\s+(?:at|with)\s+([A-Z][a-zA-Z0-9\s&.,'-]+?)(?:\.|,|;|\s+in\s|\s+for\s|\s+located\s|\n|$)",
+                # "Job Title at Company" (e.g., "Java Developer at ABC Corp")
+                r"(?:developer|engineer|analyst|manager|architect|consultant|specialist|lead|senior|junior)\s+at\s+([A-Z][a-zA-Z0-9\s&.,'-]+?)(?:\.|,|;|\s+in\s|\s+for\s|\s+located\s|\n|$)",
+                # "Job Title with Company"
+                r"(?:developer|engineer|analyst|manager|architect|consultant|specialist|lead|senior|junior)\s+with\s+([A-Z][a-zA-Z0-9\s&.,'-]+?)(?:\.|,|;|\s+in\s|\s+for\s|\s+located\s|\n|$)",
+                # "opening at Company"
+                r"opening\s+at\s+([A-Z][a-zA-Z0-9\s&.,'-]+?)(?:\.|,|;|\s+in\s|\s+for\s|\s+located\s|\n|$)",
+                # "vacancy at Company"
+                r"vacancy\s+at\s+([A-Z][a-zA-Z0-9\s&.,'-]+?)(?:\.|,|;|\s+in\s|\s+for\s|\s+located\s|\n|$)",
+            ]
+            
+            for pattern in patterns:
+                match = re.search(pattern, text, re.MULTILINE | re.IGNORECASE)
+                if match:
+                    potential_company = match.group(1).strip()
+                    
+                    # Clean up the match
+                    potential_company = re.sub(r'\s+', ' ', potential_company)
+                    potential_company = potential_company.strip('.,;: ')
+                    
+                    # Validate it looks like a company
+                    if self._is_valid_company_name(potential_company):
+                        cleaned = self._clean_company_name(potential_company)
+                        self.logger.debug(f"✓ Extracted company from position context: {cleaned}")
+                        return cleaned
+            
+            return None
+        except Exception as e:
+            self.logger.error(f"Error extracting company from position context: {str(e)}")
             return None
     
     def _is_valid_company_name(self, text: str) -> bool:
@@ -590,7 +753,21 @@ class SpacyNERExtractor:
         candidates: List[CompanyCandidate] = []
         
         try:
-            # CANDIDATE 1: HTML Span extraction (highest confidence)
+            # CANDIDATE 1: EXPLICIT CLIENT MENTIONS (HIGHEST PRIORITY - 0.95)
+            # "Client: ABC Corp", "End Client: XYZ", "Our client, TechCorp"
+            explicit_client = self.extract_client_company_explicit(text)
+            if explicit_client:
+                candidate: CompanyCandidate = {
+                    'name': explicit_client,
+                    'source': 'client_explicit',
+                    'confidence': 0.0,
+                    'type': 'client'
+                }
+                candidate['confidence'] = self._calculate_company_score(candidate, text)
+                candidates.append(candidate)
+                self.logger.info(f"🎯 Candidate from EXPLICIT CLIENT: {candidate['name']} (score: {candidate['confidence']:.2f})")
+            
+            # CANDIDATE 2: HTML Span extraction (0.90)
             if html:
                 vendor_info = self.extract_vendor_from_span(html)
                 if vendor_info.get('company'):
@@ -598,13 +775,69 @@ class SpacyNERExtractor:
                         'name': vendor_info['company'],
                         'source': 'span',
                         'confidence': 0.0,
-                        'type': 'vendor'
+                        'type': 'unknown'  # Could be client or vendor
                     }
                     candidate['confidence'] = self._calculate_company_score(candidate, html)
                     candidates.append(candidate)
                     self.logger.debug(f"Candidate from span: {candidate['name']} (score: {candidate['confidence']:.2f})")
             
-            # CANDIDATE 2: Domain extraction (very reliable if not ATS)
+            # CANDIDATE 3: Position Context Patterns (0.85)
+            # "Java Developer at ABC Corp", "role with XYZ Inc"
+            position_company = self.extract_company_from_position_context(text)
+            if position_company:
+                candidate: CompanyCandidate = {
+                    'name': position_company,
+                    'source': 'body_client_pattern',
+                    'confidence': 0.0,
+                    'type': 'client'  # Position context usually means client
+                }
+                candidate['confidence'] = self._calculate_company_score(candidate, text)
+                candidates.append(candidate)
+                self.logger.debug(f"Candidate from position context: {candidate['name']} (score: {candidate['confidence']:.2f})")
+            
+            # CANDIDATE 4: Signature extraction (0.75)
+            sig_company = self.extract_company_from_signature(text)
+            if sig_company:
+                candidate: CompanyCandidate = {
+                    'name': sig_company,
+                    'source': 'signature',
+                    'confidence': 0.0,
+                    'type': 'unknown'  # Could be vendor or client
+                }
+                candidate['confidence'] = self._calculate_company_score(candidate, text)
+                candidates.append(candidate)
+                self.logger.debug(f"Candidate from signature: {candidate['name']} (score: {candidate['confidence']:.2f})")
+            
+            # CANDIDATE 5: Body introduction extraction (0.60)
+            # "I'm from XYZ" - usually vendor introducing themselves
+            body_intro_company = self.extract_company_from_body_intro(text)
+            if body_intro_company:
+                candidate: CompanyCandidate = {
+                    'name': body_intro_company,
+                    'source': 'body_intro',
+                    'confidence': 0.0,
+                    'type': 'vendor'  # Intro usually means vendor
+                }
+                candidate['confidence'] = self._calculate_company_score(candidate, text)
+                candidates.append(candidate)
+                self.logger.debug(f"Candidate from body intro: {candidate['name']} (score: {candidate['confidence']:.2f})")
+            
+            # CANDIDATE 6: NER extraction (0.50)
+            entities = self.extract_entities(text)
+            if entities.get('company'):
+                candidate: CompanyCandidate = {
+                    'name': entities['company'],
+                    'source': 'ner',
+                    'confidence': 0.0,
+                    'type': 'unknown'
+                }
+                candidate['confidence'] = self._calculate_company_score(candidate, text)
+                candidates.append(candidate)
+                self.logger.debug(f"Candidate from NER: {candidate['name']} (score: {candidate['confidence']:.2f})")
+            
+            # CANDIDATE 7: Domain extraction (0.30 - LOWEST PRIORITY!)
+            # Email domain usually extracts VENDOR company, not CLIENT company
+            # Only use as last resort fallback
             if email:
                 domain_company = self.extract_company_from_domain(email)
                 if domain_company:
@@ -619,33 +852,7 @@ class SpacyNERExtractor:
                     }
                     candidate['confidence'] = self._calculate_company_score(candidate, text)
                     candidates.append(candidate)
-                    self.logger.debug(f"Candidate from domain: {candidate['name']} (score: {candidate['confidence']:.2f})")
-            
-            # CANDIDATE 3: Signature extraction
-            sig_company = self.extract_company_from_signature(text)
-            if sig_company:
-                candidate: CompanyCandidate = {
-                    'name': sig_company,
-                    'source': 'signature',
-                    'confidence': 0.0,
-                    'type': 'unknown'
-                }
-                candidate['confidence'] = self._calculate_company_score(candidate, text)
-                candidates.append(candidate)
-                self.logger.debug(f"Candidate from signature: {candidate['name']} (score: {candidate['confidence']:.2f})")
-            
-            # CANDIDATE 4: NER extraction (lowest confidence)
-            entities = self.extract_entities(text)
-            if entities.get('company'):
-                candidate: CompanyCandidate = {
-                    'name': entities['company'],
-                    'source': 'ner',
-                    'confidence': 0.0,
-                    'type': 'unknown'
-                }
-                candidate['confidence'] = self._calculate_company_score(candidate, text)
-                candidates.append(candidate)
-                self.logger.debug(f"Candidate from NER: {candidate['name']} (score: {candidate['confidence']:.2f})")
+                    self.logger.debug(f"Candidate from domain (VENDOR): {candidate['name']} (score: {candidate['confidence']:.2f})")
             
             # Filter candidates by minimum score
             valid_candidates = [c for c in candidates if c['confidence'] >= MIN_COMPANY_SCORE]
