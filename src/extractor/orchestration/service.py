@@ -162,6 +162,23 @@ class EmailExtractionService:
                     records_failed=total_failed,
                     execution_metadata=execution_metadata
                 )
+
+            # Save execution metadata to file
+            try:
+                from datetime import datetime
+                import json
+                
+                date_str = datetime.now().strftime('%Y-%m-%d')
+                output_dir = Path(f"output/{date_str}")
+                output_dir.mkdir(parents=True, exist_ok=True)
+                
+                output_file = output_dir / f"run_{self.run_id or 'manual'}.json"
+                with open(output_file, 'w') as f:
+                    json.dump(execution_metadata, f, indent=2, default=str)
+                
+                self.logger.info(f"Saved execution log to {output_file}")
+            except Exception as e:
+                self.logger.error(f"Failed to save execution log to file: {e}")
             
         except Exception as e:
             self.logger.error(f"Service execution failed: {str(e)}", exc_info=True)

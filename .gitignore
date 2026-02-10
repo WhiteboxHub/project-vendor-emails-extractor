@@ -73,4 +73,7 @@ setup_job_type.sql
 validate_setup.py
 test_my_account.py
 test_improvements.py
+
+# Output files
+output/
 test_my_account_fixed.py

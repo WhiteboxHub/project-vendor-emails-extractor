@@ -71,14 +71,17 @@ class MockDBClient:
 class TestWorkflowExecution(unittest.TestCase):
     
     @patch('src.extractor.workflow.manager.get_db_client')
+    @patch('src.extractor.persistence.db_candidate_source.get_db_client')
     @patch('src.extractor.orchestration.service.GmailIMAPConnector') # Mock email connection to avoid real network
     @patch('src.extractor.orchestration.service.EmailReader')
     @patch('src.extractor.orchestration.service.get_config')
-    def test_dry_run(self, mock_get_config, mock_reader_cls, mock_connector_cls, mock_get_db):
+    @patch('builtins.open', new_callable=unittest.mock.mock_open)
+    def test_dry_run(self, mock_file, mock_get_config, mock_reader_cls, mock_connector_cls, mock_get_db_source, mock_get_db_manager):
         
         # Setup DB Mock
         mock_db = MockDBClient()
-        mock_get_db.return_value = mock_db
+        mock_get_db_manager.return_value = mock_db
+        mock_get_db_source.return_value = mock_db
         
         # Setup Email Mocks
         mock_connector = mock_connector_cls.return_value
@@ -136,6 +139,28 @@ class TestWorkflowExecution(unittest.TestCase):
             print("SUCCESS: Workflow logged success status to DB.")
         else:
             self.fail("Workflow did not log success status.")
+            
+        # Verify File Output
+        # Check if open was called with a path starting with 'output/'
+        file_write_occurred = False
+        for call in mock_file.call_args_list:
+            args, _ = call
+            if args and str(args[0]).startswith('output/'):
+                file_write_occurred = True
+                print(f"SUCCESS: Attempted to write log file to: {args[0]}")
+                break
+        
+        if not file_write_occurred:
+             # It might be a Path object
+            for call in mock_file.call_args_list:
+                args, _ = call
+                if args and 'output' in str(args[0]):
+                    file_write_occurred = True
+                    print(f"SUCCESS: Attempted to write log file to: {args[0]}")
+                    break
+                    
+        if not file_write_occurred:
+            self.fail("Workflow did not attempt to save execution log to file.")
 
 if __name__ == '__main__':
     unittest.main()
