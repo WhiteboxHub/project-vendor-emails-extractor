@@ -29,13 +29,14 @@ extraction:
   # Multiple contact extraction
   extract_multiple_contacts: true  # Extract sender, from, cc as separate contacts
   
-  # Email extraction priority order (highest to lowest)
+  # Email extraction 
   email_priority:
-    - reply-to    # Direct contact (highest priority)
+    - reply-to    # Direct contact 
+    - to          # To recipients
     - sender      # Explicit sender header
     - from        # Message originator
     - cc          # CC recipients
-    - body        # Body text extraction (lowest priority)
+    - body        # Body text extraction 
   
   # Field-specific extractor priority
   fields:

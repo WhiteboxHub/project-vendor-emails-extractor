@@ -15,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from utils.config import get_config
 from utils.logging.logger import get_logger
+from utils.logging.run_summary import RunSummary
 from utils.email.connectors import GmailIMAPConnector
 from utils.email.reader import EmailReader
 from utils.preprocessor.cleaner import EmailCleaner
@@ -40,6 +41,9 @@ class EmailExtractionService:
         self.logger.info("=" * 80)
         self.logger.info("Email Contact Extractor Service Started")
         self.logger.info("=" * 80)
+        
+        # Initialize run summary tracker
+        self.run_summary = RunSummary()
         
         # Initialize components
         self._initialize_components()
@@ -99,6 +103,11 @@ class EmailExtractionService:
             self.logger.info("=" * 80)
             self.logger.info(f"Extraction Complete - Total Contacts: {total_contacts}")
             self.logger.info("=" * 80)
+            
+            # Save and print run summary
+            summary_file = self.run_summary.finalize()
+            self.run_summary.print_summary()
+            self.logger.info(f"📊 Run summary saved to: {summary_file}")
             
         except Exception as e:
             self.logger.error(f"Service execution failed: {str(e)}", exc_info=True)
@@ -218,6 +227,9 @@ class EmailExtractionService:
                     candidate_id_pk = candidate.get('id')
                     contacts_saved = self.vendor_util.save_contacts(total_contacts, candidate_id=candidate_id_pk)
                 
+                # Calculate duplicates skipped
+                duplicates_skipped = len(total_contacts) - contacts_saved
+                
                 self.logger.info(f"✓ Completed {email}: {contacts_saved} contacts saved from {filter_stats_aggregated['passed']} filtered emails")
                 
             except Exception as e:
@@ -268,6 +280,19 @@ class EmailExtractionService:
             )
         else:
             self.logger.warning(f"No candidate_id for {email} - skipping activity log")
+        
+        # Add to run summary
+        self.run_summary.add_candidate_result(
+            candidate_email=email,
+            result={
+                'emails_fetched': total_emails_fetched,
+                'contacts_extracted': len(total_contacts),
+                'contacts_inserted': contacts_saved,
+                'duplicates_skipped': duplicates_skipped,
+                'filter_stats': filter_stats_aggregated,
+                'error': error_message
+            }
+        )
         
         return contacts_saved
     
