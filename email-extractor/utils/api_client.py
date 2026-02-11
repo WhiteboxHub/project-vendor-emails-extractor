@@ -142,6 +142,36 @@ class APIClient:
             self.logger.error(f"POST request failed for {endpoint}: {str(e)}")
             raise
     
+    def patch(self, endpoint: str, data: Dict) -> Any:
+        """
+        Make PATCH request to API
+        
+        Args:
+            endpoint: API endpoint
+            data: Request body data
+            
+        Returns:
+            Response data
+        """
+        try:
+            url = f"{self.base_url}{endpoint}"
+            headers = self._get_headers()
+            
+            response = requests.patch(url, headers=headers, json=data, timeout=30)
+            
+            # Log error responses for debugging
+            if response.status_code >= 400:
+                self.logger.error(f"PATCH {endpoint} failed with status {response.status_code}")
+                self.logger.error(f"Response: {response.text}")
+            
+            response.raise_for_status()
+            
+            return response.json()
+            
+        except requests.exceptions.RequestException as e:
+            self.logger.error(f"PATCH request failed for {endpoint}: {str(e)}")
+            raise
+    
     def put(self, endpoint: str, data: Dict) -> Any:
         """
         Make PUT request to API
