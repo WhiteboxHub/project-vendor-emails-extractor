@@ -29,6 +29,9 @@ class RunSummary:
             'total_contacts_inserted': 0,
             'total_contacts_extracted': 0,
             'total_duplicates_skipped': 0,
+            'total_successful': 0,
+            'total_failed': 0,
+            'failed_candidate_emails': [],
             'candidates': [],
             'filter_stats': {
                 'total_emails': 0,
@@ -88,11 +91,15 @@ class RunSummary:
         
         # Track errors
         if result.get('error'):
+            self.summary['total_failed'] += 1
+            self.summary['failed_candidate_emails'].append(candidate_email)
             self.summary['errors'].append({
                 'candidate': candidate_email,
                 'error': result['error'],
                 'timestamp': datetime.now().isoformat()
             })
+        else:
+            self.summary['total_successful'] += 1
     
     def add_extraction_method_count(self, method: str, count: int = 1):
         """Track which extraction method was used"""
@@ -137,6 +144,8 @@ class RunSummary:
         print("=" * 80)
         print(f"Duration: {self.summary.get('duration_seconds', 0):.1f}s")
         print(f"Candidates Processed: {self.summary['total_candidates_processed']}")
+        print(f"  - Successful: {self.summary['total_successful']}")
+        print(f"  - Failed:     {self.summary['total_failed']}")
         print(f"Success Rate: {self.summary.get('success_rate', 'N/A')}")
         print(f"\nEmails Fetched: {self.summary['total_emails_fetched']}")
         print(f"Contacts Extracted: {self.summary['total_contacts_extracted']}")
@@ -149,8 +158,13 @@ class RunSummary:
         print(f"  - Not Recruiter: {self.summary['filter_stats']['not_recruiter']}")
         print(f"  - Calendar Invites: {self.summary['filter_stats']['calendar_invites']}")
         
+        if self.summary['failed_candidate_emails']:
+            print(f"\nFailed Candidates ({len(self.summary['failed_candidate_emails'])}):")
+            for email in self.summary['failed_candidate_emails']:
+                print(f"  - {email}")
+        
         if self.summary['errors']:
-            print(f"\nErrors: {len(self.summary['errors'])}")
+            print(f"\nError Details (First 5):")
             for error in self.summary['errors'][:5]:  # Show first 5
                 print(f"  - {error['candidate']}: {error['error']}")
         

@@ -107,7 +107,7 @@ class EmailExtractionService:
             # Save and print run summary
             summary_file = self.run_summary.finalize()
             self.run_summary.print_summary()
-            self.logger.info(f"📊 Run summary saved to: {summary_file}")
+            self.logger.info(f"Run summary saved to: {summary_file}")
             
         except Exception as e:
             self.logger.error(f"Service execution failed: {str(e)}", exc_info=True)

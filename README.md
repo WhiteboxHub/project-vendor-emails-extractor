@@ -77,8 +77,20 @@ Log Activity
 
 3. **Install Dependencies**
    ```bash
-   pip install -r requirements.txt
+  
+   # 1. Install PyTorch with special URL (CPU version)
+   
+   pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+   
+   pip install onnxruntime seqeval
+   
    python -m spacy download en_core_web_sm
+   
+   pip install -r requirements.txt
+
+   Verify GLiNER Works
+
+   python -c "from gliner import GLiNER; print('✓ GLiNER works!')"
    ```
 
 4. **Configure Environment**
