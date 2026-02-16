@@ -79,15 +79,16 @@ class APIClient:
             self.logger.error(f"Unexpected error during authentication: {str(e)}")
             return False
     
-    def _get_headers(self) -> Dict[str, str]:
+    def _get_headers(self, force_refresh: bool = False) -> Dict[str, str]:
         """Get headers with authentication token"""
-        if not self._is_token_valid():
+        if force_refresh or not self._is_token_valid():
             if not self.authenticate():
                 raise Exception("Failed to authenticate with API")
         
         return {
             "Authorization": f"Bearer {self.token}",
-            "Content-Type": "application/json"
+            "Content-Type": "application/json",
+            "X-Employee-ID": str(self.employee_id)
         }
     
     def get(self, endpoint: str, params: Optional[Dict] = None) -> Any:
@@ -106,8 +107,13 @@ class APIClient:
             headers = self._get_headers()
             
             response = requests.get(url, headers=headers, params=params, timeout=self.DEFAULT_TIMEOUT)
-            response.raise_for_status()
             
+            if response.status_code == 401:
+                self.logger.warning(f"GET {endpoint} returned 401, retrying with fresh token...")
+                headers = self._get_headers(force_refresh=True)
+                response = requests.get(url, headers=headers, params=params, timeout=self.DEFAULT_TIMEOUT)
+                
+            response.raise_for_status()
             return response.json()
             
         except requests.exceptions.RequestException as e:
@@ -131,13 +137,17 @@ class APIClient:
             
             response = requests.post(url, headers=headers, json=data, timeout=self.DEFAULT_TIMEOUT)
             
+            if response.status_code == 401:
+                self.logger.warning(f"POST {endpoint} returned 401, retrying with fresh token...")
+                headers = self._get_headers(force_refresh=True)
+                response = requests.post(url, headers=headers, json=data, timeout=self.DEFAULT_TIMEOUT)
+            
             # Log error responses for debugging
             if response.status_code >= 400:
                 self.logger.error(f"POST {endpoint} failed with status {response.status_code}")
                 self.logger.error(f"Response: {response.text}")
             
             response.raise_for_status()
-            
             return response.json()
             
         except requests.exceptions.RequestException as e:
@@ -145,27 +155,55 @@ class APIClient:
             raise
     
     def put(self, endpoint: str, data: Dict) -> Any:
-        """
-        Make PUT request to API
-        
-        Args:
-            endpoint: API endpoint
-            data: Request body data
-            
-        Returns:
-            Response data
-        """
         try:
             url = f"{self.base_url}{endpoint}"
             headers = self._get_headers()
             
             response = requests.put(url, headers=headers, json=data, timeout=self.DEFAULT_TIMEOUT)
-            response.raise_for_status()
             
+            if response.status_code == 401:
+                self.logger.warning(f"PUT {endpoint} returned 401, retrying with fresh token...")
+                headers = self._get_headers(force_refresh=True)
+                response = requests.put(url, headers=headers, json=data, timeout=self.DEFAULT_TIMEOUT)
+
+            # Log all responses during debugging
+            self.logger.info(f"PUT {endpoint} | Status: {response.status_code}")
+            if response.status_code >= 400:
+                self.logger.error(f"Response: {response.text}")
+            else:
+                self.logger.debug(f"Response: {response.text}")
+                
+            response.raise_for_status()
             return response.json()
             
         except requests.exceptions.RequestException as e:
             self.logger.error(f"PUT request failed for {endpoint}: {str(e)}")
+            raise
+
+    def patch(self, endpoint: str, data: Dict) -> Any:
+        """
+        Make PATCH request to API
+        """
+        try:
+            url = f"{self.base_url}{endpoint}"
+            headers = self._get_headers()
+            
+            response = requests.patch(url, headers=headers, json=data, timeout=self.DEFAULT_TIMEOUT)
+            
+            if response.status_code == 401:
+                self.logger.warning(f"PATCH {endpoint} returned 401, retrying with fresh token...")
+                headers = self._get_headers(force_refresh=True)
+                response = requests.patch(url, headers=headers, json=data, timeout=self.DEFAULT_TIMEOUT)
+
+            self.logger.info(f"PATCH {endpoint} | Status: {response.status_code}")
+            if response.status_code >= 400:
+                self.logger.error(f"Response: {response.text}")
+                
+            response.raise_for_status()
+            return response.json()
+            
+        except requests.exceptions.RequestException as e:
+            self.logger.error(f"PATCH request failed for {endpoint}: {str(e)}")
             raise
     
     def delete(self, endpoint: str) -> Any:
