@@ -64,15 +64,15 @@ class LocationExtractor:
         # Location patterns (City, State ZIP) - STRICT with word boundaries
         # Pattern explanation:
         # \b - Word boundary (prevents "Or Dallas", "Lo Alto")
-        # [A-Z][a-z]+ - Proper capitalization (prevents "SQL", "ID", "THANK")
-        # (?:\s+[A-Z][a-z]+)* - Multi-word cities (Palo Alto, Santa Clara)
+        # [A-Z_] - Allow leading _ for robustness
+        # [\w\s]+ - Allow alphanumeric + spaces + _
         # {3,30} - Length validation (prevents single letters and very long phrases)
         self.location_patterns = [
             # "City, ST 12345" - STRICT State case [A-Z]{2}
-            r'\b([A-Z][a-z]+(?:\s+[A-Za-z][a-z]+){0,3}),\s*([A-Z]{2})\b(?:\s*(\d{5}(?:-\d{4})?))?',
+            r'\b([A-Z_][\w\s]+?),\s*([A-Z]{2})\b(?:\s*(\d{5}(?:-\d{4})?))?',
             
             # "Location: City, ST" - STRICT State case [A-Z]{2}
-            r'(?:Location|City|Based in|Located in):\s*([A-Z][a-z]+(?:\s+[A-Za-z][a-z]+){0,3}),\s*([A-Z]{2})\b(?:\s*(\d{5}(?:-\d{4})?))?',
+            r'(?:Location|City|Based in|Located in):\s*([A-Z_][\w\s]+?),\s*([A-Z]{2})\b(?:\s*(\d{5}(?:-\d{4})?))?',
         ]
     
     def _load_location_filters(self):
@@ -318,8 +318,8 @@ class LocationExtractor:
         if not city:
             return None
         
-        # Remove extra whitespace
-        city = ' '.join(city.split())
+        # Remove extra whitespace and STRIP delimiters like _ and ()
+        city = ' '.join(city.split()).strip(' _()')
         
         # Remove common location prefixes that get captured by regex
         # "Agent Santa Clara" → "Santa Clara"

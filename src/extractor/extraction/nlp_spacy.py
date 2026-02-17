@@ -172,6 +172,33 @@ class SpacyNERExtractor:
             self.logger.error(f"Failed to load vendor indicators from CSV: {str(e)} - using empty list")
             return []
     
+    def extract_vendor_from_span(self, html_content: str) -> Dict[str, Optional[str]]:
+        """Extract vendor name and company from HTML span tags (e.g. <span>Name - Company</span>) with relaxed matching"""
+        try:
+            if not html_content:
+                return {'name': None, 'company': None}
+            
+            # Simple regex on HTML to find span content
+            # Pattern: <span ...>Name - Company</span>
+            # Relaxed: Allow _ in company parts (e.g. "_Acme Corp_")
+            span_pattern = r'<span[^>]*>\s*([A-Za-z0-9\s\.]+)\s*[:\-]+\s*([A-Za-z0-9_\-&. ]+)\s*</span>'
+            
+            match = re.search(span_pattern, html_content, re.IGNORECASE)
+            if match:
+                name = match.group(1).strip()
+                company = match.group(2).strip(' _')  # Strip spaces and underscores
+                
+                # Basic validation
+                if len(company) > 1 and len(company) < 100:
+                    self.logger.debug(f"✓ Extracted vendor info from span: {name} - {company}")
+                    return {'name': name, 'company': company}
+            
+            return {'name': None, 'company': None}
+            
+        except Exception as e:
+            self.logger.error(f"Error extracting vendor from span: {str(e)}")
+            return {'name': None, 'company': None}
+
     def extract_entities(self, text: str) -> Dict[str, str]:
         """
         Extract named entities from text
@@ -235,10 +262,79 @@ class SpacyNERExtractor:
                     if 2 <= len(words) <= 3 and not any(c.isdigit() for c in name):
                         return name
             
+            
             return None
         except Exception as e:
             self.logger.error(f"Error extracting name from signature: {str(e)}")
             return None
+
+    def extract_signature_info(self, text: str) -> Dict[str, Optional[str]]:
+        """
+        Extract structured info from email signature (Name, Title, Company).
+        
+        Returns:
+            Dict with keys: name, title, company, phone, email
+        """
+        result = {
+            'name': None,
+            'title': None,
+            'company': None,
+            'phone': None,
+            'email': None
+        }
+        try:
+            # 1. Finds blocks that look like signatures (bottom of email, short lines)
+            lines = text.split('\n')
+            
+            # Simple heuristic: Look at last 10 lines
+            sig_lines = lines[-15:] if len(lines) > 15 else lines
+            
+            # Find name line (usually starts with Thanks/Regards or is just a name)
+            name_idx = -1
+            
+            # Greeting patterns
+            greeting_pattern = r'^(?:Thanks|Regards|Best|Sincerely|Warm regards|Kind regards|Cheers),?\s*$'
+            
+            for i, line in enumerate(sig_lines):
+                line = line.strip()
+                if not line:
+                    continue
+                    
+                # Check if this line is a greeting
+                if re.match(greeting_pattern, line, re.IGNORECASE):
+                    # Next non-empty line is likely the name
+                    for j in range(i + 1, len(sig_lines)):
+                        potential_name = sig_lines[j].strip()
+                        if potential_name:
+                            # Validate name
+                            words = potential_name.split()
+                            if 2 <= len(words) <= 4 and not any(c.isdigit() for c in potential_name):
+                                result['name'] = potential_name
+                                name_idx = j
+                                break
+                    if result['name']:
+                        break
+            
+            # If name found, look for title/company in subsequent lines
+            if name_idx != -1 and name_idx + 1 < len(sig_lines):
+                # Next line is often Title
+                potential_title = sig_lines[name_idx + 1].strip()
+                if potential_title and len(potential_title.split()) <= 6:
+                     # Basic validation: Shouldn't be a phone number or email
+                    if not re.search(r'\d', potential_title) and '@' not in potential_title:
+                        result['title'] = potential_title
+                
+                # Line after title is often Company
+                if name_idx + 2 < len(sig_lines):
+                    potential_company = sig_lines[name_idx + 2].strip()
+                    if potential_company and not result['company']:
+                        if self._is_valid_company_name(potential_company):
+                             result['company'] = self._clean_company_name(potential_company)
+
+            return result
+        except Exception as e:
+            self.logger.error(f"Error parsing signature info: {e}")
+            return result
     
     def extract_vendor_from_span(self, text: str) -> Dict[str, Optional[str]]:
         """Extract vendor name and company from HTML span tags or similar patterns
@@ -255,23 +351,24 @@ class SpacyNERExtractor:
         """
         try:
             # Multiple patterns to try (ordered by reliability)
+            # RELAXED PATTERNS: Allow special chars like _, (), ', - in company names and don't enforce leading Capital
+            company_chars = r"[a-zA-Z0-9\s&.,_()'\-]"
+            
             patterns = [
                 # Pattern 1: HTML tags with Name - Company (hyphen separator)
-                r'<(?:span|div|p|td|th|b|strong)[^>]*>\s*([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})\s*[-–—]\s*([A-Z][a-zA-Z0-9\s&.,]+?)\s*</(?:span|div|p|td|th|b|strong)>',
+                r'<(?:span|div|p|td|th|b|strong)[^>]*>\s*([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})\s*[-–—]\s*(' + company_chars + r'+?)\s*</(?:span|div|p|td|th|b|strong)>',
                 # Pattern 2: HTML tags with Name | Company (pipe separator)
-                r'<(?:span|div|p|td|th|b|strong)[^>]*>\s*([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})\s*\|\s*([A-Z][a-zA-Z0-9\s&.,]+?)\s*</(?:span|div|p|td|th|b|strong)>',
+                r'<(?:span|div|p|td|th|b|strong)[^>]*>\s*([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})\s*\|\s*(' + company_chars + r'+?)\s*</(?:span|div|p|td|th|b|strong)>',
                 # Pattern 3: HTML tags with Name, Company (comma separator)
-                r'<(?:span|div|p|td|th|b|strong)[^>]*>\s*([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})\s*,\s*([A-Z][a-zA-Z0-9\s&.,]+?)\s*</(?:span|div|p|td|th|b|strong)>',
+                r'<(?:span|div|p|td|th|b|strong)[^>]*>\s*([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})\s*,\s*(' + company_chars + r'+?)\s*</(?:span|div|p|td|th|b|strong)>',
                 # Pattern 4: HTML tags with Name (Company) (parentheses)
-                r'<(?:span|div|p|td|th|b|strong)[^>]*>\s*([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})\s*\(\s*([A-Z][a-zA-Z0-9\s&.,]+?)\s*\)\s*</(?:span|div|p|td|th|b|strong)>',
+                r'<(?:span|div|p|td|th|b|strong)[^>]*>\s*([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})\s*\(\s*(' + company_chars + r'+?)\s*\)\s*</(?:span|div|p|td|th|b|strong)>',
                 # Pattern 5: Plain text with Name - Company (for text emails)
-                r'(?:^|\n)\s*([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})\s*[-–—]\s*([A-Z][a-zA-Z0-9\s&.,]+?)\s*(?:$|\n)',
+                r'(?:^|\n)\s*([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})\s*[-–—]\s*(' + company_chars + r'+?)\s*(?:$|\n)',
                 # Pattern 6: Plain text with Name | Company
-                r'(?:^|\n)\s*([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})\s*\|\s*([A-Z][a-zA-Z0-9\s&.,]+?)\s*(?:$|\n)',
+                r'(?:^|\n)\s*([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})\s*\|\s*(' + company_chars + r'+?)\s*(?:$|\n)',
                 # Pattern 7: Name at Company format
-                r'<(?:span|div|p)[^>]*>\s*([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})\s+at\s+([A-Z][a-zA-Z0-9\s&.,]+?)\s*</(?:span|div|p)>',
-                # Pattern 8: Signature-style Name\nCompany (newline separated in HTML)
-                r'<(?:span|div|p|b|strong)[^>]*>\s*([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})\s*</(?:span|div|p|b|strong)>\s*(?:<br\s*/?>|\n)\s*<(?:span|div|p)[^>]*>\s*([A-Z][a-zA-Z0-9\s&.,]+?)\s*</(?:span|div|p)>',
+                r'<(?:span|div|p)[^>]*>\s*([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})\s+at\s+(' + company_chars + r'+?)\s*</(?:span|div|p)>',
             ]
             
             for pattern in patterns:
@@ -284,10 +381,10 @@ class SpacyNERExtractor:
                     name_words = name.split()
                     if 2 <= len(name_words) <= 4 and not any(c.isdigit() for c in name):
                         # Clean company name
-                        # Remove HTML tags, extra whitespace, trailing punctuation
+                        # Remove HTML tags, extra whitespace, trailing punctuation AND underscores
                         company = re.sub(r'<[^>]+>', '', company)  # Remove any HTML tags
                         company = re.sub(r'\s+', ' ', company)      # Normalize whitespace
-                        company = company.strip('.,;: ')
+                        company = company.strip('.,;: _-')          # Strip delimiters including _
                         
                         # Validate company (not empty, not too long, has letters)
                         if company and 1 < len(company) < 100 and any(c.isalpha() for c in company):

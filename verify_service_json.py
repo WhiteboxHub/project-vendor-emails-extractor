@@ -8,11 +8,14 @@ from dotenv import load_dotenv
 project_root = Path(__file__).parent
 sys.path.insert(0, str(project_root))
 
+import logging
+logging.basicConfig(level=logging.INFO)
+
 from src.extractor.orchestration.service import EmailExtractionService
 
 # Mock Candidate Source
 class MockCandidateSource:
-    def get_active_candidates(self):
+    def get_active_candidates(self, **kwargs):
         # Load from .env or hardcoded
         email = os.getenv('TEST_EMAIL')
         password = os.getenv('TEST_APP_PASSWORD')

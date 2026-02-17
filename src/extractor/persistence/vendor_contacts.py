@@ -35,10 +35,23 @@ class VendorUtil:
                 if row.get('email'):
                     existing.add(row['email'].strip().lower())
             
+            
             self.logger.info(f"Loaded {len(existing)} existing contacts for deduplication")
             return existing
         except Exception as e:
             self.logger.error(f"Failed to fetch existing contacts: {e}")
+            return set()
+
+    def get_recent_vendor_emails(self, limit: int = 5000) -> set:
+        """Fetch recently extracted unique vendor emails for global deduplication cache."""
+        try:
+            query = "SELECT email FROM vendor_contact_extracts GROUP BY email ORDER BY MAX(id) DESC LIMIT %s"
+            results = self.db_client.execute_query(query, (limit,))
+            existing = {row['email'].strip().lower() for row in results if row.get('email')}
+            self.logger.info(f"Loaded {len(existing)} global vendor emails for cache")
+            return existing
+        except Exception as e:
+            self.logger.error(f"Failed to fetch global vendor cache: {e}")
             return set()
 
 
@@ -106,19 +119,20 @@ class VendorUtil:
         if not candidate_id:
             return result
 
-        raw_positions = self._build_raw_positions_payload(filtered_contacts, candidate_id)
-        if not raw_positions:
-            self.logger.info("No raw positions produced from filtered vendor contacts")
+        raw_job_listings = self._build_raw_job_listings_payload(filtered_contacts, candidate_id)
+        if not raw_job_listings:
+            self.logger.info("No raw job listings produced from filtered vendor contacts")
             return result
 
         try:
-            self.logger.info("Sending %s raw positions to /api/raw-positions/bulk", len(raw_positions))
-            response = self.api_client.post("/api/raw-positions/bulk", {"positions": raw_positions})
-            inserted, skipped = self._extract_insert_skip_counts(response, default_inserted=len(raw_positions))
+            self.logger.info("Sending %s raw job listings to /api/raw-positions/bulk", len(raw_job_listings))
+            # Endpoint uses /api/raw-positions but maps to RawJobListing in backend
+            response = self.api_client.post("/api/raw-positions/bulk", {"positions": raw_job_listings})
+            inserted, skipped = self._extract_insert_skip_counts(response, default_inserted=len(raw_job_listings))
             result["positions_inserted"] = inserted
             result["positions_skipped"] = skipped
         except Exception as error:
-            self.logger.error("Error saving raw positions: %s", error)
+            self.logger.error("Error saving raw job listings: %s", error)
 
         return result
 
@@ -145,7 +159,7 @@ class VendorUtil:
                 payload.append(item)
         return payload
 
-    def _build_raw_positions_payload(self, contacts: List[Dict], candidate_id: int) -> List[Dict]:
+    def _build_raw_job_listings_payload(self, contacts: List[Dict], candidate_id: int) -> List[Dict]:
         payload = []
         for contact in contacts:
             # Only generate a raw position for contacts that carry job content.

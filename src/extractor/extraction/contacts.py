@@ -8,6 +8,7 @@ from .nlp_gliner import GLiNERExtractor
 from .positions import PositionExtractor
 from .location import LocationExtractor
 from .employment_type import EmploymentTypeExtractor
+from .classification import RecruiterClassifier
 from ..filtering.repository import get_filter_repository
 
 logger = logging.getLogger(__name__)
@@ -23,6 +24,9 @@ class ContactExtractor:
         
         # Initialize filter repository
         self.filter_repo = get_filter_repository()
+        
+        # Initialize classifier
+        self.recruiter_classifier = RecruiterClassifier()
         
         # Load filter lists from CSV (no hardcoded fallbacks)
         self.greeting_patterns = self._load_greeting_patterns()
@@ -216,6 +220,28 @@ class ContactExtractor:
                     'source': source_email,
                     'extraction_source': source  # Track where email came from
                 }
+
+                # Extract signature info (Name, Title, Company) for classification
+                signature_info = {}
+                if self.spacy_extractor:
+                    signature_info = self.spacy_extractor.extract_signature_info(clean_body)
+                
+                # GLiNER Fallback: If Spacy missed title (crucial for classification), try GLiNER
+                if not signature_info.get('title') and self.gliner_extractor:
+                    try:
+                        # Extract entities (GLiNER handles signature block extraction internally)
+                        gliner_entities = self.gliner_extractor.extract_entities(clean_body)
+                        if gliner_entities.get('job_title'):
+                            signature_info['title'] = gliner_entities['job_title']
+                            self.logger.debug(f"GLiNER rescued title: {signature_info['title']}")
+                        
+                        # Also enhance name/company if missing
+                        if not signature_info.get('name') and gliner_entities.get('name'):
+                            signature_info['name'] = gliner_entities['name']
+                        if not signature_info.get('company') and gliner_entities.get('company'):
+                            signature_info['company'] = gliner_entities['company']
+                    except Exception as e:
+                        self.logger.warning(f"GLiNER fallback failed: {e}")
                 
                 # Use vendor info from span if available
                 if vendor_info.get('name'):
@@ -230,9 +256,10 @@ class ContactExtractor:
                     if header_name and not self._is_candidate_name(header_name, source_email):
                         contact['name'] = header_name
                     
+                    
                     # PRIORITY 2: Try signature extraction (but validate it's not candidate)
-                    if not contact['name'] and self.spacy_extractor:
-                        signature_name = self.spacy_extractor.extract_name_from_signature(clean_body)
+                    if not contact['name'] and signature_info.get('name'):
+                        signature_name = signature_info['name']
                         if signature_name and not self._is_candidate_name(signature_name, source_email):
                             contact['name'] = signature_name
                     
@@ -376,6 +403,28 @@ class ContactExtractor:
                         self.logger.warning(f"⚠️  Company looks like a location - rejecting: {contact['company']}")
                         contact['company'] = None
                 
+                        contact['company'] = None
+                
+                # CLASSIFY RECRUITER STATUS (ML/Heuristic)
+                # Use title from signature if available
+                sender_title = signature_info.get('title')
+                
+                # Run classification
+                is_recruiter, score, reason = self.recruiter_classifier.is_recruiter(sender_title, clean_body)
+                
+                # Store classification results
+                contact['is_recruiter'] = is_recruiter
+                contact['recruiter_score'] = score
+                contact['recruiter_reason'] = reason
+                contact['sender_job_title'] = sender_title
+                
+                # Strict Mode Check (Configurable)
+                # If enabled, strict mode rejects contacts that aren't classified as recruiters
+                strict_mode = self.config.get('extraction', {}).get('strict_recruiter_check', False)
+                if strict_mode and not is_recruiter:
+                    self.logger.info(f"Skipping contact {email_addr}: Not identified as recruiter ({reason}) - Strict Mode ON")
+                    continue
+
                 # Final validation and cleanup
                 contact = self._validate_and_clean_contact(contact)
                 

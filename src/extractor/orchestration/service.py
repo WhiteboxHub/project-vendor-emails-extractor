@@ -16,6 +16,7 @@ from ..persistence.db_candidate_source import DatabaseCandidateSource
 from ..persistence.job_activity import JobActivityLogUtil
 from ..persistence.vendor_contacts import VendorUtil
 from ..state.uid_tracker import get_uid_tracker
+from ..state.cache import DeduplicationCache
 from ..workflow.manager import WorkflowManager
 
 logger = logging.getLogger(__name__)
@@ -48,6 +49,7 @@ class EmailExtractionService:
         self.extractor = None
         self.email_filter = None
         self.uid_tracker = None
+        self.deduplication_cache = None
         self.candidate_runner = None
 
         self._initialize_components()
@@ -78,6 +80,8 @@ class EmailExtractionService:
 
         tracker_file = self.runtime_parameters.get("uid_tracker_file", "last_run.json")
         self.uid_tracker = get_uid_tracker(tracker_file)
+        
+        self.deduplication_cache = DeduplicationCache()
 
         self.candidate_runner = CandidateRunner(
             config=self.config,
@@ -85,6 +89,7 @@ class EmailExtractionService:
             extractor=self.extractor,
             email_filter=self.email_filter,
             uid_tracker=self.uid_tracker,
+            deduplication_cache=self.deduplication_cache,
             vendor_util=self.vendor_util,
             connector_cls=GmailIMAPConnector,
             reader_cls=EmailReader,
@@ -110,6 +115,12 @@ class EmailExtractionService:
         total_emails_fetched = 0
 
         try:
+            # Initialize global deduplication cache from DB if available
+            if self.vendor_util and self.deduplication_cache:
+                self.logger.info("Initializing global deduplication cache...")
+                recent_emails = self.vendor_util.get_recent_vendor_emails(limit=5000)
+                self.deduplication_cache.add_known_db_emails(recent_emails)
+
             candidates = self.candidate_source.get_active_candidates(
                 candidate_id=candidate_id,
                 candidate_email=candidate_email,
@@ -131,6 +142,9 @@ class EmailExtractionService:
                     execution_metadata=summary,
                 )
                 self._persist_execution_log(summary)
+                # Generate and save JSON report
+                report = self._generate_json_report(summary)
+                self._save_json_report(report)
                 return summary
 
             for candidate in candidates:
@@ -173,6 +187,9 @@ class EmailExtractionService:
                 execution_metadata=summary,
             )
             self._persist_execution_log(summary)
+            # Generate and save JSON report
+            report = self._generate_json_report(summary)
+            self._save_json_report(report)
             return summary
         except Exception as error:
             self.logger.error("Service execution failed: %s", error, exc_info=True)
@@ -193,6 +210,9 @@ class EmailExtractionService:
                 execution_metadata=summary,
             )
             self._persist_execution_log(summary)
+            # Generate and save JSON report even on failure
+            report = self._generate_json_report(summary)
+            self._save_json_report(report)
             raise
 
     def _update_run_status(
@@ -253,6 +273,96 @@ class EmailExtractionService:
             self.logger.info("Saved execution log to %s", output_file)
         except Exception as error:
             self.logger.error("Failed to save execution log to file: %s", error)
+
+    def _generate_json_report(self, execution_metadata: Dict) -> Dict:
+        """Generate a comprehensive JSON report for the extraction run."""
+        candidates_data = execution_metadata.get("candidates", [])
+        
+        # Calculate aggregated metrics
+        total_emails_fetched = sum(c.get("emails_fetched", 0) for c in candidates_data)
+        total_duplicates = sum(c.get("duplicates_skipped", 0) for c in candidates_data)
+        total_non_vendor = sum(c.get("non_vendor_filtered", 0) for c in candidates_data)
+        total_inserted = sum(c.get("emails_inserted", 0) for c in candidates_data)
+        
+        # Separate successful and failed candidates
+        successful = [c for c in candidates_data if c.get("status") == "success"]
+        failed = [c for c in candidates_data if c.get("status") != "success"]
+        
+        # Calculate duration
+        started = execution_metadata.get("started_at")
+        finished = execution_metadata.get("finished_at")
+        duration_seconds = None
+        if started and finished:
+            try:
+                start_dt = datetime.fromisoformat(started.replace("Z", "+00:00"))
+                finish_dt = datetime.fromisoformat(finished.replace("Z", "+00:00"))
+                duration_seconds = (finish_dt - start_dt).total_seconds()
+            except Exception:
+                pass
+        
+        report = {
+            "run_metadata": {
+                "run_id": self.run_id,
+                "workflow_id": self.workflow_id,
+                "workflow_key": "email_extractor",
+                "started_at": started,
+                "finished_at": finished,
+                "duration_seconds": duration_seconds,
+            },
+            "summary": {
+                "total_candidates": len(candidates_data),
+                "successful_candidates": len(successful),
+                "failed_candidates": len(failed),
+                "total_emails_fetched": total_emails_fetched,
+                "total_emails_inserted": total_inserted,
+                "total_duplicates": total_duplicates,
+                "total_non_vendor": total_non_vendor,
+            },
+            "candidates": candidates_data,
+            "successful_candidates": [c.get("candidate_email") for c in successful],
+            "failed_candidates": [c.get("candidate_email") for c in failed],
+            "failed_candidate_details": [
+                {
+                    "candidate_email": c.get("candidate_email"),
+                    "candidate_id": c.get("candidate_id"),
+                    "candidate_name": c.get("candidate_name"),
+                    "error": c.get("error"),
+                }
+                for c in failed
+            ],
+        }
+        
+        return report
+
+    def _save_json_report(self, report: Dict):
+        """Save the JSON report to the output/reports directory."""
+        try:
+            # Create reports directory
+            reports_dir = Path("output") / "reports"
+            reports_dir.mkdir(parents=True, exist_ok=True)
+            
+            # Generate timestamped filename
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            report_file = reports_dir / f"extraction_report_{timestamp}.json"
+            latest_report = reports_dir / "latest_extraction_report.json"
+            
+            # Save timestamped report
+            with open(report_file, "w", encoding="utf-8") as f:
+                json.dump(report, f, indent=2, default=str)
+            
+            # Save as latest report (overwrite)
+            with open(latest_report, "w", encoding="utf-8") as f:
+                json.dump(report, f, indent=2, default=str)
+            
+            self.logger.info("=" * 80)
+            self.logger.info("📊 EXTRACTION REPORT SAVED")
+            self.logger.info("=" * 80)
+            self.logger.info(f"📁 Timestamped Report: {report_file.absolute()}")
+            self.logger.info(f"📄 Latest Report:      {latest_report.absolute()}")
+            self.logger.info("=" * 80)
+            
+        except Exception as error:
+            self.logger.error("Failed to save JSON report: %s", error)
 
     def _log_activity(
         self,

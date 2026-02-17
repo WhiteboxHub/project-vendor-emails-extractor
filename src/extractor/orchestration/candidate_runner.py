@@ -11,22 +11,30 @@ class CandidateRunResult:
     candidate_id: Optional[int]
     email: str
     status: str
+    candidate_name: Optional[str] = None
     contacts_saved: int = 0
     positions_saved: int = 0
     contacts_deduplicated: int = 0  # Track efficiency
     emails_fetched: int = 0
+    last_uid: Optional[str] = None
+    duplicates_skipped: int = 0
+    non_vendor_filtered: int = 0
     filter_stats: Dict[str, int] = field(default_factory=dict)
     error: Optional[str] = None
 
     def to_metadata(self) -> Dict:
         return {
             "candidate_id": self.candidate_id,
-            "email": self.email,
+            "candidate_name": self.candidate_name,
+            "candidate_email": self.email,
             "status": self.status,
+            "emails_fetched": self.emails_fetched,
+            "last_uid": self.last_uid,
+            "duplicates_skipped": self.duplicates_skipped,
+            "non_vendor_filtered": self.non_vendor_filtered,
+            "emails_inserted": self.contacts_saved,  # Alias for clarity in report
             "contacts_saved": self.contacts_saved,
             "positions_saved": self.positions_saved,
-            "contacts_deduplicated": self.contacts_deduplicated,
-            "emails_fetched": self.emails_fetched,
             "filter_stats": self.filter_stats,
             "error": self.error,
         }
@@ -45,6 +53,7 @@ class CandidateRunner:
         vendor_util,
         connector_cls=GmailIMAPConnector,
         reader_cls=EmailReader,
+        deduplication_cache=None,
     ):
         self.config = config
         self.cleaner = cleaner
@@ -54,16 +63,19 @@ class CandidateRunner:
         self.vendor_util = vendor_util
         self.connector_cls = connector_cls
         self.reader_cls = reader_cls
+        self.deduplication_cache = deduplication_cache
         self.logger = logging.getLogger(__name__)
 
     def run(self, candidate: Dict) -> CandidateRunResult:
         email = (candidate.get("email") or "").strip()
         password = candidate.get("imap_password")
         candidate_id = candidate.get("candidate_id") or candidate.get("id")
+        candidate_name = candidate.get("name") or candidate.get("full_name")  # Extract name from candidate dict
 
         if not email:
             return CandidateRunResult(
                 candidate_id=candidate_id,
+                candidate_name=candidate_name,
                 email="",
                 status="failed",
                 error="Missing candidate email",
@@ -71,6 +83,7 @@ class CandidateRunner:
         if not password:
             return CandidateRunResult(
                 candidate_id=candidate_id,
+                candidate_name=candidate_name,
                 email=email,
                 status="failed",
                 error="Missing candidate IMAP password",
@@ -88,6 +101,7 @@ class CandidateRunner:
         if not connector.connect():
             return CandidateRunResult(
                 candidate_id=candidate_id,
+                candidate_name=candidate_name,
                 email=email,
                 status="failed",
                 error="Authentication failed - unable to connect to IMAP server",
@@ -103,6 +117,7 @@ class CandidateRunner:
         emails_fetched = 0
         deduplicated_count = 0
         extracted_contacts: List[Dict] = []
+        last_processed_uid = None  # Track the last UID processed
 
         try:
             reader = self.reader_cls(connector)
@@ -151,7 +166,18 @@ class CandidateRunner:
 
                             contact["raw_body"] = clean_body
                             contact["extracted_from_uid"] = email_data.get("uid")
+                            
+                            # Check global run cache (Intra-run deduplication)
+                            if self.deduplication_cache and self.deduplication_cache.is_seen_in_run(contact_email):
+                                deduplicated_count += 1
+                                self.logger.info(f"Skipping intra-run duplicate: {contact_email}")
+                                continue
+
                             extracted_contacts.append(contact)
+                            
+                            # Mark as seen in run cache
+                            if self.deduplication_cache:
+                                self.deduplication_cache.mark_seen_in_run(contact_email)
                     except Exception as extraction_error:
                         self.logger.error(
                             "Error extracting candidate_id=%s email=%s uid=%s: %s",
@@ -164,6 +190,7 @@ class CandidateRunner:
                 if emails:
                     max_uid = max(int(item["uid"]) for item in emails)
                     self.uid_tracker.update_last_uid(email, str(max_uid))
+                    last_processed_uid = str(max_uid)  # Track for reporting
 
                 if next_start_index is None:
                     break
@@ -178,15 +205,22 @@ class CandidateRunner:
             self.logger.info(f"  - Unique to Save:       {len(extracted_contacts)}")
             self.logger.info("=" * 60)
 
+            # Calculate non-vendor filtered count
+            non_vendor_count = filter_stats.get("junk", 0) + filter_stats.get("not_recruiter", 0)
+            
             if not self.vendor_util:
                 return CandidateRunResult(
                     candidate_id=candidate_id,
+                    candidate_name=candidate_name,
                     email=email,
                     status="success",
                     contacts_saved=len(extracted_contacts),
                     positions_saved=0,
                     contacts_deduplicated=deduplicated_count,
                     emails_fetched=emails_fetched,
+                    last_uid=last_processed_uid,
+                    duplicates_skipped=deduplicated_count,
+                    non_vendor_filtered=non_vendor_count,
                     filter_stats=filter_stats,
                 )
 
@@ -195,12 +229,16 @@ class CandidateRunner:
                 save_result = {"contacts_inserted": int(save_result), "positions_inserted": 0}
             return CandidateRunResult(
                 candidate_id=candidate_id,
+                candidate_name=candidate_name,
                 email=email,
                 status="success",
                 contacts_saved=save_result.get("contacts_inserted", 0),
                 positions_saved=save_result.get("positions_inserted", 0),
                 contacts_deduplicated=deduplicated_count,
                 emails_fetched=emails_fetched,
+                last_uid=last_processed_uid,
+                duplicates_skipped=deduplicated_count,
+                non_vendor_filtered=non_vendor_count,
                 filter_stats=filter_stats,
             )
         except Exception as processing_error:
@@ -211,12 +249,17 @@ class CandidateRunner:
                 processing_error,
                 exc_info=True,
             )
+            non_vendor_count = filter_stats.get("junk", 0) + filter_stats.get("not_recruiter", 0)
             return CandidateRunResult(
                 candidate_id=candidate_id,
+                candidate_name=candidate_name,
                 email=email,
                 status="failed",
                 error=str(processing_error),
                 emails_fetched=emails_fetched,
+                last_uid=last_processed_uid,
+                duplicates_skipped=deduplicated_count,
+                non_vendor_filtered=non_vendor_count,
                 filter_stats=filter_stats,
             )
         finally:
