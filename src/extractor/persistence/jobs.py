@@ -26,11 +26,24 @@ class JobPersistence:
             )
             
             # Extract results based on common API patterns
+            jobs = []
             if isinstance(response, list):
-                return response
+                jobs = response
             elif isinstance(response, dict):
-                return response.get('results', response.get('data', []))
-            return []
+                jobs = response.get('results', response.get('data', []))
+            
+            # Debug logging for statuses
+            if jobs:
+                sample_statuses = [f"ID {j.get('id')}: {j.get('processing_status')}" for j in jobs[:3]]
+                self.logger.info(f"Sample statuses from API: {', '.join(sample_statuses)}")
+
+            # Specific Fix: Client-side filter to ensure only 'new' records are processed
+            filtered_jobs = [j for j in jobs if j.get('processing_status') == 'new']
+            
+            if len(filtered_jobs) < len(jobs):
+                self.logger.warning(f"Filtered out {len(jobs) - len(filtered_jobs)} records that were not 'new'")
+                
+            return filtered_jobs
             
         except Exception as e:
             self.logger.error(f"Failed to fetch raw jobs: {e}")
@@ -53,8 +66,11 @@ class JobPersistence:
         Update the processing status of a raw job listing.
         """
         try:
+            # Server definition: @router.put("/{raw_job_listing_id}")
+            # Router prefix: /raw-positions
+            # NO trailing slash should be used here.
             self.api_client.put(
-                f"/api/raw-positions/{raw_id}/", 
+                f"/api/raw-positions/{raw_id}", 
                 {"processing_status": status}
             )
             return True

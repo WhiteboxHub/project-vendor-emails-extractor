@@ -27,7 +27,7 @@ logging.basicConfig(
 logger = logging.getLogger("llm_classifier")
 
 class LLMJobClassifyOrchestrator:
-    def __init__(self, dry_run: bool = False, batch_size: int =10, threshold: float = 0.7):
+    def __init__(self, dry_run: bool = False, batch_size: int = 15, threshold: float = 0.7):
         self.dry_run = dry_run
         self.batch_size = batch_size
         self.audit_log = Path("classification_audit_llm.log")
@@ -45,45 +45,51 @@ class LLMJobClassifyOrchestrator:
             sys.exit(1)
 
     def run(self):
-        logger.info(f"Starting LLM classification cycle (Dry Run: {self.dry_run}, Batch: {self.batch_size})")
+        print("\n" + "="*60)
+        print(" STARTING LLM JOB CLASSIFICATION ENGINE")
+        print("="*60)
+        logger.info(f"Mode: {'DRY RUN' if self.dry_run else 'PRODUCTION'} | Batch: {self.batch_size}")
         
         while True:
             # 1. Fetch raw jobs
             raw_jobs = self.persistence.fetch_raw_jobs(limit=self.batch_size)
             if not raw_jobs:
-                logger.info("No new raw jobs to process. Exiting.")
+                print("\n" + "-"*60)
+                print(" No new jobs to process. System idling.")
+                print("-"*60 + "\n")
                 break
             
-            logger.info(f"Processing batch of {len(raw_jobs)} raw jobs using LLM...")
+            print(f"\nProcessing batch of {len(raw_jobs)} candidates...")
             
-            for raw_job in raw_jobs:
+            for i, raw_job in enumerate(raw_jobs, 1):
                 raw_id = raw_job.get('id')
+                title = raw_job.get('raw_title', 'Unknown Title')
+                company = raw_job.get('raw_company', 'Unknown Company')
+                
+                print(f"\n[{i}/{len(raw_jobs)}] Inspecting ID: {raw_id}")
+                print(f"      Role: {title}")
+                print(f"      Org : {company}")
+
                 try:
                     # 2. Preprocess
                     input_text = self.preprocessor.format_input(
-                        title=raw_job.get('raw_title'),
-                        company=raw_job.get('raw_company'),
+                        title=title,
+                        company=company,
                         location=raw_job.get('raw_location'),
                         description=raw_job.get('raw_description')
                     )
 
-                    logger.info(f"Processing raw job ID {raw_id}: {input_text}")
-                    
                     # 3. Classify with LLM
                     result = self.classifier.classify(input_text)
                     
                     # Audit logging
                     self._log_audit(raw_id, result)
                     
-                    logger.info(f"ID: {raw_id} | LLM Label: {result['label']} | Score: {result['score']:.2f}")
-                    if result.get('reasoning'):
-                        logger.debug(f"Reasoning: {result['reasoning']}")
-                    
                     if result['is_valid']:
                         # 4. Prepare and Save Valid Job
                         job_data = {
-                            "title": raw_job.get('raw_title', 'Untitled Position'),
-                            "company_name": raw_job.get('raw_company', 'Unknown Company'),
+                            "title": title[:200], # Safety truncate
+                            "company_name": company[:200],
                             "location": raw_job.get('raw_location'),
                             "source": "email_bot_llm_local",
                             "raw_position_id": raw_id,
@@ -92,21 +98,34 @@ class LLMJobClassifyOrchestrator:
                         }
                         
                         if not self.dry_run:
-                            self.persistence.save_valid_job(job_data)
-                            logger.info(f"ID: {raw_id} | Saved to job_listing table (LLM)")
-                    
-                    # 5. Mark as processed in raw table
-                    if not self.dry_run:
-                        success = self.persistence.update_raw_status(raw_id, "parsed")
-                        if success:
-                            logger.info(f"ID: {raw_id} | Status updated to 'parsed'")
+                            save_success = self.persistence.save_valid_job(job_data)
+                            if save_success:
+                                logger.info(f"       Saved to job_listing table")
+                                # 5. Mark as processed ONLY after successful save
+                                status_success = self.persistence.update_raw_status(raw_id, "parsed")
+                                if status_success:
+                                    logger.info(f"       Status marked as 'parsed'")
+                            else:
+                                logger.error(f"       Failed to persist job. Status remains 'new'.")
+                        else:
+                            print(f"      [DRY RUN] Would save to database.")
+                    else:
+                        # Even if junk, we mark as parsed so we don't pick it up again
+                        if not self.dry_run:
+                            status_success = self.persistence.update_raw_status(raw_id, "parsed")
+                            if status_success:
+                                logger.info(f" Junk filtered and marked as 'parsed'")
+                        else:
+                            print(f" [DRY RUN] Would mark as 'parsed' (junk).")
                         
                 except Exception as e:
-                    logger.error(f"Error processing raw job ID {raw_id}: {e}")
+                    logger.error(f" Error processing ID {raw_id}: {e}")
                     continue
             
             if self.dry_run:
-                logger.info("[DRY RUN] Finished first batch. Exiting.")
+                print("\n" + "="*60)
+                print(" DRY RUN COMPLETE - Review logs for accuracy.")
+                print("="*60 + "\n")
                 break
             
             time.sleep(1)
@@ -118,8 +137,11 @@ class LLMJobClassifyOrchestrator:
             f"{timestamp} | ID: {raw_id:6} | Label: {result['label']:10} | "
             f"Score: {result['score']:.2f} | Reasoning: {reasoning[:100]}...\n"
         )
-        with open(self.audit_log, "a", encoding="utf-8") as f:
-            f.write(entry)
+        try:
+            with open(self.audit_log, "a", encoding="utf-8") as f:
+                f.write(entry)
+        except Exception as e:
+            logger.error(f"Failed to write to audit log: {e}")
 
 def main():
     parser = argparse.ArgumentParser(description="Classify raw job listings using Local LLM")

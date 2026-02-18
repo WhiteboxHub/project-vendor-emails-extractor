@@ -4,6 +4,7 @@ import json
 import re
 import httpx
 from typing import Dict, List, Optional
+import time 
 
 logger = logging.getLogger(__name__)
 
@@ -21,7 +22,15 @@ class LLMJobClassifier:
         self.logger = logging.getLogger(__name__)
         self.threshold = threshold
         self.base_url = base_url.rstrip('/')
-        self.generate_endpoint = f"{self.base_url}/generate"
+        self.generate_endpoint = f"{self.base_url}/generate" # Removed trailing slash to avoid 307 redirect
+        
+        # Specific Fix: Use a persistent httpx client for efficiency and reliability
+        self.client = httpx.Client(
+            base_url=self.base_url,
+            timeout=httpx.Timeout(120.0, connect=10.0),
+            headers={"Content-Type": "application/json"},
+            follow_redirects=True
+        )
         
         self.logger.info(f"Local LLM initialized at: {self.generate_endpoint}")
 
@@ -29,110 +38,112 @@ class LLMJobClassifier:
         """
         Constructs a strict system instruction for JSON-only classification.
         """
-
         return (
-            "You are a strict JSON generator and expert recruitment assistant.\n"
-            "Your task is to classify the given text into ONE of two categories:\n"
-            "- valid_job\n"
-            "- junk\n\n"
-
-            "CLASSIFICATION RULES:\n"
+            "You are a strict JSON generator and expert recruitment assistant. "
+            "Your task is to classify text into ONE category: 'valid_job' or 'junk'.\n\n"
+            "DEFINITIONS:\n"
             "valid_job:\n"
-            "- Must describe a SPECIFIC open position (e.g., 'Senior Python Developer', 'Data Analyst')\n"
-            "- Must include specific responsibilities or requirements for that role\n"
-            "- NOT a general 'we are hiring' announcement\n\n"
-
+            "- Describes a specific job opening with title, responsibilities, or requirements.\n"
             "junk:\n"
-            "- General 'We are hiring' or 'Join our team' posts without specific role details\n"
-            "- Lists of multiple potential roles without details (e.g., 'Hiring Java, .NET, QA')\n"
-            "- Email signatures\n"
-            "- Company advertisements\n"
-            "- Candidate profiles looking for jobs\n"
-            "- Spam, newsletters, marketing\n\n"
-
-            "CRITICAL OUTPUT RULES:\n"
-            "- Output ONLY valid JSON\n"
-            "- No explanations outside JSON\n"
-            "- No markdown\n"
-            "- No extra text\n"
-            "- No prefixes or suffixes\n\n"
-
-            "OUTPUT FORMAT:\n"
+            "- Generic hiring announcements, resumes, signatures, marketing, or newsletters.\n\n"
+            "OUTPUT FORMAT (Strict JSON only):\n"
             "{\n"
             "  \"reasoning\": \"One sentence explanation\",\n"
             "  \"label\": \"valid_job\" or \"junk\",\n"
             "  \"confidence\": number between 0.0 and 1.0\n"
-            "}\n\n"
-
-            "OUTPUT JSON:"
+            "}"
         )
+
     def classify(self, text: str) -> Dict:
         """
-        Perform local LLM-based classification.
+        Perform local LLM-based classification using prompt-based payload and retry logic.
         """
         if not text:
-            return {'label': 'junk', 'confidence': 1.0, 'reasoning': 'Empty text'}
+            return {'label': 'junk', 'score': 0.0, 'is_valid': False, 'reasoning': 'Empty text'}
 
-        # Fix #3: Add junk keyword filter before saving/processing
-        junk_keywords = [
-            "we are hiring", "join our team", "hiring now", "open positions", 
-            "click here", "subscribe", "newsletter", "follow us"
-        ]
-        text_lower = text.lower()
-        if len(text.split()) < 10:  # Too short
-             return {'label': 'junk', 'confidence': 1.0, 'reasoning': 'Text too short'}
-             
-        # If text is dominated by junk keywords without specific role details
-        # This is a simple heuristic; LLM is better, but this saves tokens
-        # We'll let LLM handle the nuance, but if it's JUST "We are hiring" we skip
-        if any(text_lower == k for k in junk_keywords):
-             return {'label': 'junk', 'confidence': 0.9, 'reasoning': 'Generic hiring slogan'}
+        # Pre-filter for very short text
+        if len(text.split()) < 5:
+             return {'label': 'junk', 'score': 1.0, 'is_valid': False, 'reasoning': 'Text too short'}
 
-        try:
-            # Truncate text to keep prompt within reasonable limits
-            if len(text) > 4000:
-                text = text[:4000]
+        max_retries = 3
+        backoff = 2
 
-            payload = {
-                "prompt": f"{self.build_system_prompt()}\n\nClassify this text:\n\n{text}",
-                "system": self.build_system_prompt() # If the local API supports a system field
-            }
-            
-            # Note: We use a synchronous request here to match the existing BERT/Groq implementation pattern
-            # in the orchestrator, but httpx allows for easy async later if needed.
-            with httpx.Client(timeout=60.0) as client:
-                response = client.post(self.generate_endpoint, json=payload)
+        for attempt in range(max_retries):
+            try:
+                # Optimized Fix: Use 'prompt' directly as expected by the local server
+                # Combine system prompt and user text into one block
+                combined_prompt = f"{self.build_system_prompt()}\n\nClassify this job text:\n\n{text[:4000]}"
+                
+                payload = {
+                    "prompt": combined_prompt,
+                    "model": "qwen2.5:1.5b",
+                    "temperature": 0.0
+                }
+
+                self.logger.info(f"  [LLM] Requesting classification (Attempt {attempt + 1})...")
+                response = self.client.post("/generate", json=payload)
+                
+                # Handle rate limiting or server errors with backoff
+                if response.status_code in [429, 500, 502, 503, 504]:
+                    wait_time = backoff ** (attempt + 1)
+                    self.logger.warning(f"  [LLM] API error ({response.status_code}). Retrying in {wait_time}s...")
+                    time.sleep(wait_time)
+                    continue
+
                 response.raise_for_status()
                 data = response.json()
-            
-            # The structure of 'data' depends on the local API server's implementation.
-            # Usually, local wrappers return the text in a 'text' or 'response' key.
-            output_text = data.get('text', data.get('response', data.get('generated_text', data.get('output', '')))).strip()
-            
-            # Log the raw response for debugging
-            self.logger.info(f"Raw LLM response (first 300 chars): {output_text[:300]}")
+                
+                # Check for various response structures
+                if isinstance(data, str):
+                    output_text = data.strip()
+                elif isinstance(data, dict):
+                    # Check keys in order of likelihood for this specific server
+                    output_text = (
+                        data.get('output') or 
+                        data.get('response') or 
+                        data.get('text') or 
+                        data.get('generated_text') or 
+                        ""
+                    ).strip()
+                    
+                    # Special check for OpenAI choices format
+                    if not output_text and 'choices' in data:
+                        output_text = data['choices'][0].get('message', {}).get('content', '').strip()
+                else:
+                    output_text = str(data).strip()
+                
+                if not output_text:
+                    raise ValueError(f"Empty or unparseable response from LLM. Data: {data}")
+                
+                # Attempt to parse JSON from response
+                result = self._parse_json_from_text(output_text)
+                
+                label = result.get('label', 'junk').lower()
+                score = float(result.get('confidence', 0.5))
+                reasoning = result.get('reasoning', 'No reasoning provided')
+                
+                is_valid = (label == 'valid_job') and (score >= self.threshold)
+                
+                # Log a summary in a clean format without symbols
+                status_label = "VALID" if is_valid else "JUNK"
+                self.logger.info(f"  [LLM] Result: {status_label} (score: {score:.2f})")
+                self.logger.info(f"  [LLM] Logic : {reasoning}")
 
-            # Attempt to parse JSON from response if the local model didn't return pure JSON
-            result = self._parse_json_from_text(output_text)
-            
-            self.logger.info(f"LLM Classification reasoning for raw job: {result.get('reasoning', '')}")
+                return {
+                    'label': "valid" if is_valid else "junk",
+                    'score': score,
+                    'is_valid': is_valid,
+                    'reasoning': reasoning,
+                    'raw_llm_output': output_text
+                }
 
-            label = result.get('label', 'junk').lower()
-            score = float(result.get('confidence', 0.5))
-            
-            is_valid = (label == 'valid_job') and (score >= self.threshold)
-            
-            return {
-                'label': "valid" if is_valid else "junk",
-                'score': score,
-                'is_valid': is_valid,
-                'reasoning': result.get('reasoning', ''),
-                'raw_llm_output': output_text
-            }
-            
-        except Exception as e:
-            self.logger.error(f"Local LLM Classification error: {e}")
-            return {'label': 'error', 'score': 0.0, 'is_valid': False}
+            except (httpx.RequestError, ValueError) as e:
+                self.logger.error(f"  [LLM] Connection or Parsing Error: {e}")
+                if attempt == max_retries - 1:
+                    return {'label': 'error', 'score': 0.0, 'is_valid': False, 'reasoning': str(e)}
+                time.sleep(backoff ** attempt)
+
+        return {'label': 'error', 'score': 0.0, 'is_valid': False, 'reasoning': 'Unknown error'}
 
     def _parse_json_from_text(self, text: str) -> Dict:
         """
