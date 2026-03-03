@@ -17,7 +17,20 @@ import json
 
 from ..connectors.http_api import APIClient
 from ..filtering.repository import get_filter_repository
+from .duckdb_raw_listings import RawJobListingsDuckDB
 from datetime import datetime
+import sys
+from pathlib import Path
+
+# Auto-log generator (scripts/generate_duckdb_log.py)
+try:
+    _SCRIPTS_DIR = Path(__file__).resolve().parents[3] / "scripts"
+    if str(_SCRIPTS_DIR) not in sys.path:
+        sys.path.insert(0, str(_SCRIPTS_DIR))
+    from generate_duckdb_log import write_duckdb_log as _write_duckdb_log, _print_summary as _print_duckdb_summary
+    _HAS_DUCKDB_LOG = True
+except Exception:
+    _HAS_DUCKDB_LOG = False
 
 logger = logging.getLogger(__name__)
 
@@ -186,19 +199,54 @@ class VendorUtil:
         else:
             self.logger.info("No contacts prepared for vendor_contact bulk insert")
 
-        # ── Step 5: Bulk POST → raw_positions API ─────────────────────────────
+        # ── Step 5: raw_job_listings ──────────────────────────────────────────
         # candidate_id may be None (run across multiple candidates) — each
         # contact carries its own 'candidate_id' set by candidate_runner.
         raw_job_listings = self._build_raw_job_listings_payload(truly_new_contacts)
         if raw_job_listings:
+            # ── Step 5a: Local DuckDB only (API path disabled for now) ────────
+            # TODO: When ready to push to production, uncomment Step 5b below.
             try:
-                self.logger.info("Sending %s raw job listings to /api/raw-positions/bulk", len(raw_job_listings))
-                response = self.api_client.post("/api/raw-positions/bulk", {"positions": raw_job_listings})
-                inserted, skipped = self._extract_insert_skip_counts(response, default_inserted=len(raw_job_listings))
-                result["positions_inserted"] = inserted
-                result["positions_skipped"] = skipped
-            except Exception as error:
-                self.logger.error("Error saving raw job listings: %s", error)
+                duckdb_store = RawJobListingsDuckDB()
+                duckdb_inserted = duckdb_store.insert_bulk(raw_job_listings)
+                duckdb_stats = duckdb_store.get_stats()
+                duckdb_store.close()
+                self.logger.info(
+                    "DuckDB: %d/%d raw_job_listings rows stored | cumulative stats: %s",
+                    duckdb_inserted,
+                    len(raw_job_listings),
+                    duckdb_stats,
+                )
+                result["positions_inserted"] = duckdb_inserted
+
+                # ── Auto-generate duckdb_logs.json ────────────────────────
+                if _HAS_DUCKDB_LOG:
+                    try:
+                        import json as _json
+                        log_path = _write_duckdb_log()
+                        self.logger.info("DuckDB log written → %s", log_path)
+                        # Print colored summary to terminal so user sees results immediately
+                        _log_data = _json.loads(log_path.read_text(encoding="utf-8"))
+                        _print_duckdb_summary(_log_data)
+                        run_num = _log_data.get("run_number", "?")
+                        print(f"  ✓ DuckDB run #{run_num} log saved → {log_path.name}")
+                        print(f"    (Latest alias: data/duckdb_logs.json)\n")
+                    except Exception as log_err:
+                        self.logger.warning("Could not write duckdb_logs.json: %s", log_err)
+            except Exception as duckdb_error:
+                self.logger.warning("DuckDB write failed: %s", duckdb_error)
+
+            # ── Step 5b: Bulk POST → /api/raw-positions/bulk  [DISABLED] ─────
+            # Uncomment the block below when you are ready to push to MySQL:
+            #
+            # try:
+            #     self.logger.info("Sending %s raw job listings to /api/raw-positions/bulk", len(raw_job_listings))
+            #     response = self.api_client.post("/api/raw-positions/bulk", {"positions": raw_job_listings})
+            #     inserted, skipped = self._extract_insert_skip_counts(response, default_inserted=len(raw_job_listings))
+            #     result["positions_inserted"] = inserted
+            #     result["positions_skipped"] = skipped
+            # except Exception as error:
+            #     self.logger.error("Error saving raw job listings: %s", error)
         else:
             self.logger.info("No raw job listings produced from filtered vendor contacts")
 

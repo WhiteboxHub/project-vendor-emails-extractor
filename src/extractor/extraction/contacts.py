@@ -284,13 +284,20 @@ class ContactExtractor:
                     # PRIORITY 1: Extract name from the specific header that contained this email
                     if not contact['name']:
                         header_name = self._extract_name_from_header_for_email(email_message, contact['email'])
-                        if header_name and not self._is_candidate_name(header_name, source_email):
+                        # FIX: Also apply _is_valid_person_name gate here — prevents display
+                        # names like "Recruiting Team", "HR Bot", "Talent Acquisition" from
+                        # being stored. Header display names are frequently role/team labels.
+                        if (header_name
+                                and self._is_valid_person_name(header_name)
+                                and not self._is_candidate_name(header_name, source_email)):
                             contact['name'] = header_name
 
                     # PRIORITY 2: Try signature extraction (but validate it's not candidate)
                     if not contact['name'] and signature_info.get('name'):
                         signature_name = signature_info['name']
-                        if signature_name and not self._is_candidate_name(signature_name, source_email):
+                        if (signature_name
+                                and self._is_valid_person_name(signature_name)
+                                and not self._is_candidate_name(signature_name, source_email)):
                             contact['name'] = signature_name
 
                     # PRIORITY 3 (email local-part) deliberately removed — produces junk names
@@ -427,12 +434,18 @@ class ContactExtractor:
                         self.logger.warning(f"❌ Location overlaps with company - rejecting location: {contact['location']} (keeping company: {contact['company']})")
                         contact['location'] = None
                 
-                # Additional check: If company looks like a location, reject it
-                if contact['company'] and self.spacy_extractor:
-                    if hasattr(self.spacy_extractor, '_is_location') and self.spacy_extractor._is_location(contact['company']):
-                        self.logger.warning(f"⚠️  Company looks like a location - rejecting: {contact['company']}")
-                        contact['company'] = None
-                
+                # FIX: If company string is recognised by spaCy as a GPE/LOC entity
+                # (geo-political entity / location) rather than ORG, discard it so that
+                # city names like "Des Moines" don't end up stored as company names.
+                # Fully dynamic — no hardcoded city list needed.
+                _spacy_nlp = self.spacy_extractor.nlp if self.spacy_extractor else None
+                if contact['company'] and _spacy_nlp:
+                    _company_doc = _spacy_nlp(contact['company'])
+                    _company_labels = {ent.label_ for ent in _company_doc.ents}
+                    if _company_labels and _company_labels.issubset({'GPE', 'LOC', 'FAC'}) and 'ORG' not in _company_labels:
+                        self.logger.warning(
+                            f"⚠️  Company '{contact['company']}' tagged as {_company_labels} by spaCy — rejecting as geo entity"
+                        )
                         contact['company'] = None
                 
                 # CLASSIFY RECRUITER STATUS (ML/Heuristic)
@@ -968,34 +981,57 @@ class ContactExtractor:
     
     def _extract_company_from_email(self, email: str) -> Optional[str]:
         """Extract company name from email domain as fallback
-        
+
         Args:
             email: Email address (e.g., prakash.k@nityo.com)
-            
+
         Returns:
-            Company name (e.g., "Nityo") or None if blocked domain
+            Company name (e.g., "Nityo") or None if blocked/ambiguous domain
         """
         if not email or '@' not in email:
             return None
-        
+
         try:
             # Extract domain
             domain = email.split('@')[1].lower()
-            
+
             # Check if domain is blocked (gmail, yahoo, etc.) using filter_repo
             if self.filter_repo.check_email(email) == 'block':
                 self.logger.debug(f"✗ Blocked personal domain for company extraction: {domain}")
                 return None
-            
+
             # Remove TLD (.com, .co, .org, .net, etc.)
             company_name = domain.split('.')[0]
-            
+
+            # FIX: Reject very short/vague domain words (4 chars or fewer)
+            # — e.g. "dice", "icio", "cio", "co" — are too ambiguous as company names.
+            # Real company domains worth carrying are usually 5+ characters.
+            if len(company_name) <= 4:
+                self.logger.debug(
+                    f"✗ Domain-derived company too short to use as name: '{company_name}' (from {email})"
+                )
+                return None
+
+            # FIX: Skip known ATS/platform single-word domains that slip through
+            # the blocked_ats_domain filter (they come from the email body, not headers).
+            _domain_junk = {
+                'lever', 'greenhouse', 'workday', 'taleo', 'icims', 'breezy',
+                'recruitee', 'ashbyhq', 'jobvite', 'jazz', 'sapient', 'ziprecruiter',
+                'monster', 'glassdoor', 'careerbuilder', 'ladders', 'hired',
+                'handshake', 'clearbit', 'gem', 'gem',
+            }
+            if company_name.lower() in _domain_junk:
+                self.logger.debug(
+                    f"✗ Domain-derived company is a known ATS/platform: '{company_name}' (from {email})"
+                )
+                return None
+
             # Capitalize first letter
             company_name = company_name.capitalize()
-            
+
             self.logger.debug(f"✓ Extracted company from email domain: {company_name} (from {email})")
             return company_name
-            
+
         except Exception as e:
             self.logger.error(f"Error extracting company from email: {str(e)}")
             return None

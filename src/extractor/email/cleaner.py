@@ -44,19 +44,40 @@ class EmailCleaner:
     
     def _remove_quoted_replies(self, text: str) -> str:
         """Remove quoted email replies and forwarded messages"""
-        # Common reply patterns
-        patterns = [
+        # Common reply patterns (split at first occurrence)
+        split_patterns = [
             r"On .+ wrote:",
             r"From:.+Sent:.+To:.+Subject:",
             r"_{5,}",  # Long underscores (email separators)
-            r"-{5,}",  # Long dashes
+            r"-{5,}",  # Long dashes (email separators)
             r"Begin forwarded message:",
+            r"\bwrote:\s*$",  # Standalone "wrote:" at end of line
         ]
-        
-        for pattern in patterns:
-            parts = re.split(pattern, text, maxsplit=1)
+
+        for pattern in split_patterns:
+            parts = re.split(pattern, text, maxsplit=1, flags=re.MULTILINE)
             text = parts[0]
-        
+
+        # Strip lines that begin with ">" (standard plain-text quoted reply format)
+        # e.g.  > On Mon, Jan 1 John Doe <john@x.com> wrote:
+        lines = text.split('\n')
+        cleaned_lines = []
+        for line in lines:
+            stripped = line.lstrip()
+            if stripped.startswith('>'):
+                # Once we hit a quoted block, stop — everything below is reply context
+                break
+            cleaned_lines.append(line)
+        text = '\n'.join(cleaned_lines)
+
+        # Remove "Sent from my iPhone / Android / …" device signatures (common in plain-text)
+        text = re.sub(
+            r'\n\s*Sent from my (iPhone|Android|iPad|Samsung|BlackBerry|Windows Phone|mobile device)[^\n]*',
+            '',
+            text,
+            flags=re.IGNORECASE
+        )
+
         return text
     
     def _normalize_whitespace(self, text: str) -> str:

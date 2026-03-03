@@ -209,11 +209,33 @@ def main():
                 candidate_email=parameters.get("candidate_email"),
             )
             
+            # ── Always write DuckDB log at end of every run ───────────────────
+            # This fires regardless of whether new contacts were inserted,
+            # so you always get a timestamped log file in data/.
+            try:
+                _scripts_dir = Path(__file__).resolve().parents[1] / "scripts"
+                if str(_scripts_dir) not in sys.path:
+                    sys.path.insert(0, str(_scripts_dir))
+                from generate_duckdb_log import write_duckdb_log, _print_summary
+                import json as _json
+
+                numbered_path = write_duckdb_log()
+                _log_data = _json.loads(numbered_path.read_text(encoding="utf-8"))
+                _print_summary(_log_data)
+                run_num = _log_data.get("run_number", "?")
+                logger.info(
+                    "DuckDB run #%s log → %s  (latest alias: data/duckdb_logs.json)",
+                    run_num, numbered_path.name,
+                )
+            except Exception as _log_err:
+                logger.warning("Could not write DuckDB run log: %s", _log_err)
+
             # 5. Update Schedule Status (if applicable)
             if schedule_id:
                 manager.update_schedule_status(schedule_id)
             
             logger.info(f"Workflow run {run_id} completed successfully.")
+
             
         except Exception as e:
             logger.error(f"Workflow execution failed: {e}")

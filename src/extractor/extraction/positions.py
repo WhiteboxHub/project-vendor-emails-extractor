@@ -221,7 +221,24 @@ class PositionExtractor:
             else:
                 self.marketing_fluff = []
                 self.logger.warning("⚠ position_marketing_fluff not found in CSV")
-                
+
+            # Load req ID prefix pattern — strips codes like "1615 - " from job titles
+            if 'position_req_id_prefix_pattern' in keyword_lists:
+                raw_patterns = keyword_lists['position_req_id_prefix_pattern']
+                if raw_patterns:
+                    try:
+                        self.req_id_pattern = re.compile(raw_patterns[0].strip(), re.IGNORECASE)
+                        self.logger.info(f"✓ Loaded req ID prefix pattern from CSV: {raw_patterns[0].strip()}")
+                    except re.error as _re_err:
+                        self.logger.warning(f"⚠ Invalid req ID prefix pattern in CSV: {_re_err}")
+                        self.req_id_pattern = re.compile(r'^[\w]{1,10}\s*[-\u2013\u2014]\s*', re.IGNORECASE)
+                else:
+                    self.req_id_pattern = None
+            else:
+                # Dynamic fallback — covers numeric/alphanumeric codes up to 10 chars
+                self.req_id_pattern = re.compile(r'^[\w]{1,10}\s*[-\u2013\u2014]\s*', re.IGNORECASE)
+                self.logger.warning("⚠ position_req_id_prefix_pattern not found in CSV - using built-in fallback")
+
         except Exception as e:
             self.logger.error(f"Failed to load position filters from CSV: {str(e)}")
             # CRITICAL: Initialize ALL attributes to prevent AttributeError
@@ -236,6 +253,7 @@ class PositionExtractor:
             self.company_prefixes = []
             self.core_keywords = set()
             self.marketing_fluff = []
+            self.req_id_pattern = None
     
     def _normalize_acronyms_in_text(self, text: str) -> str:
         """Normalize common acronym patterns BEFORE extraction
@@ -462,7 +480,20 @@ class PositionExtractor:
         """Clean and normalize job position text with CSV-driven filters"""
         if not position:
             return position
-        
+
+        # 0. Strip leading req/job-ID codes FIRST (e.g. "1615 - ", "REQ-4492 – ")
+        # Pattern is loaded from CSV (position_req_id_prefix_pattern) — fully dynamic.
+        # Only strip when the part AFTER the dash starts with a capital letter (i.e. is a real title)
+        # so we don't accidentally strip legitimate titles like "AI/ML - Engineer".
+        if self.req_id_pattern:
+            _req_match = self.req_id_pattern.match(position)
+            if _req_match:
+                _after = position[_req_match.end():].strip()
+                # Only strip if remainder starts with a letter and is long enough to be a title
+                if _after and _after[0].isalpha() and len(_after) >= 3:
+                    self.logger.debug(f"✂ Stripped req ID prefix '{_req_match.group()}' from title: {position}")
+                    position = _after
+
         # 1. Strip HTML/XML tags and entities using CSV patterns
         position = self._strip_html_comprehensive(position)
         
