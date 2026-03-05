@@ -17,10 +17,12 @@ __pycache__/
 .Python
 venv/
 myenv/
+myvenv/
 models/
 env/
 ENV/
 .env.example
+data/
 
 # Test outputs
 test_results_*.json

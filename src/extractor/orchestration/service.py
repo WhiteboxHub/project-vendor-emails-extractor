@@ -158,7 +158,7 @@ class EmailExtractionService:
 
             if not candidates:
                 self.logger.warning("No candidates found with email credentials")
-                summary = self._finalize_summary(execution_metadata, 0, 0, 0, 0)
+                summary = self._finalize_summary(execution_metadata, 0, 0, 0, 0, 0)
                 self._update_run_status(
                     status="success",
                     records_processed=0,

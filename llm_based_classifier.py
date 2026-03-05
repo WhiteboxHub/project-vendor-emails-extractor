@@ -42,14 +42,20 @@ class LLMJobClassifyOrchestrator:
             
             # Load Groq config if available
             groq_key = os.getenv("GROQ_API_KEY")
-            groq_model = os.getenv("GROQ_MODEL") or os.getenv("MODEL_NAME")
+            
+            # Smart Model Selection:
+            # If GROQ_API_KEY is available, use GROQ_MODEL or MODEL_NAME.
+            # Otherwise, use None to let the LLMJobClassifier default to the local model (qwen2.5:1.5b).
+            model = None
+            if groq_key:
+                model = os.getenv("GROQ_MODEL") or os.getenv("MODEL_NAME")
             
             self.classifier = LLMJobClassifier(
                 api_key=groq_key,
-                model=groq_model,
+                model=model,
                 threshold=threshold
             )
-            logger.info("LLM components initialized successfully")
+            logger.info(f"LLM components initialized successfully (Provider: {'Groq' if groq_key else 'Local'})")
         except Exception as e:
             logger.error(f"Failed to initialize components: {e}")
             sys.exit(1)
@@ -252,7 +258,7 @@ class LLMJobClassifyOrchestrator:
 def main():
     parser = argparse.ArgumentParser(description="Classify raw job listings using Local LLM")
     parser.add_argument("--dry-run", action="store_true", help="Run without writing to DB/API")
-    parser.add_argument("--batch-size", type=int, default=10, help="Number of records per batch (LLM is slower than BERT)")
+    parser.add_argument("--batch-size", type=int, default=100, help="Number of records per batch (LLM is slower than BERT)")
     parser.add_argument("--threshold", type=float, default=0.7, help="Confidence threshold")
     args = parser.parse_args()
      

@@ -1,13 +1,20 @@
 import csv
 import logging
 import argparse
-from pathlib import Path
-from typing import List, Dict, Set
-from utils.api_client import get_api_client
-import shutil
 import os
 import sys
+from pathlib import Path
+from typing import List, Dict, Set
+import shutil
 from dotenv import load_dotenv
+
+# Add project root to path for imports
+project_root = Path(__file__).resolve().parent.parent
+if str(project_root) not in sys.path:
+    sys.path.insert(0, str(project_root))
+
+from src.extractor.connectors.http_api import get_api_client
+
 load_dotenv()
 
 # Configure logging
