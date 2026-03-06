@@ -4,8 +4,17 @@ import logging
 import sys
 import os
 import time
+import json
 from pathlib import Path
+from datetime import datetime
 from dotenv import load_dotenv
+
+class DateTimeEncoder(json.JSONEncoder):
+    """Handle datetime objects in JSON serialization."""
+    def default(self, obj):
+        if isinstance(obj, datetime):
+            return obj.isoformat()
+        return super().default(obj)
 
 # Add src to path for imports
 project_root = Path(__file__).parent
@@ -15,6 +24,7 @@ from src.extractor.connectors.http_api import get_api_client
 from src.extractor.preprocessor.bert_preprocessor import BERTPreprocessor
 from src.extractor.extraction.llm_classifier import LLMJobClassifier
 from src.extractor.persistence.jobs import JobPersistence
+from src.extractor.extraction.ner_validator import NERValidator
 
 # Setup logging
 logging.basicConfig(
@@ -55,6 +65,10 @@ class LLMJobClassifyOrchestrator:
                 model=model,
                 threshold=threshold
             )
+            
+            # Initialize NER Validator
+            self.ner_validator = NERValidator(use_gliner=False) # GLiNER is slow, stick to rule-based post-validation for now
+            
             logger.info(f"LLM components initialized successfully (Provider: {'Groq' if groq_key else 'Local'})")
         except Exception as e:
             logger.error(f"Failed to initialize components: {e}")
@@ -65,6 +79,21 @@ class LLMJobClassifyOrchestrator:
         print(" STARTING LLM JOB CLASSIFICATION ENGINE")
         print("="*60)
         logger.info(f"Mode:----- {'DRY RUN' if self.dry_run else 'PRODUCTION'} | Batch: {self.batch_size}")
+        
+        # Stats and record tracking
+        stats = {
+            "total": 0,
+            "classified_valid": 0,
+            "finalized_after_ner": 0,
+            "junk": 0,
+            "errors": 0
+        }
+        
+        records = {
+            "valid": [],       # LLM said valid
+            "finalized": [],   # Passed NER
+            "junk": []         # LLM said junk
+        }
         
         current_skip = 0
         while True:
@@ -120,6 +149,7 @@ class LLMJobClassifyOrchestrator:
                     # Audit logging
                     self._log_audit(raw_id, result)
                     
+                    stats["total"] += 1
                     processed_in_batch += 1
 
                     if result['is_valid']:
@@ -127,7 +157,6 @@ class LLMJobClassifyOrchestrator:
                         # Extract extra metadata from payload if available
                         payload = raw_job.get('raw_payload') or {}
                         if isinstance(payload, str):
-                            import json
                             try:
                                 payload = json.loads(payload)
                             except:
@@ -191,8 +220,8 @@ class LLMJobClassifyOrchestrator:
                             "contact_email": payload.get('contact_email') or '',
                             "contact_phone": payload.get('contact_phone') or '',
 
-                            # Job URL
-                            "job_url": payload.get('post_url') or payload.get('url') or payload.get('link') or '',
+                            # Job URL - Strictly use job_url only
+                            "job_url": payload.get('job_url') or '',
 
                             # Notes: store keyword match reasons for auditing
                             "notes": payload.get('job_matches') or '',
@@ -200,6 +229,31 @@ class LLMJobClassifyOrchestrator:
                             # Scoring
                             "confidence_score": result['score'],
                         }
+                        
+                        # Store in valid records
+                        records["valid"].append({
+                            "raw_job": raw_job,
+                            "llm_result": result,
+                            "mapped_data": job_data.copy()
+                        })
+                        
+                        stats["classified_valid"] += 1
+                        
+                        # 4a. NER Validation & Finalization
+                        ner_result = self.ner_validator.validate_and_finalize(raw_job, job_data, result)
+                        job_data = ner_result['job_data']
+                        
+                        if ner_result['is_finalized']:
+                            stats["finalized_after_ner"] += 1
+                            logger.info(f"       NER Finalization SUCCESS")
+                            # Store in finalized records
+                            records["finalized"].append({
+                                "raw_job": raw_job,
+                                "llm_result": result,
+                                "finalized_data": ner_result['job_data']
+                            })
+                        else:
+                            logger.warning(f"       NER Finalization incomplete: {', '.join(ner_result['errors'])}")
                         
                         if not self.dry_run:
                             save_success = self.persistence.save_valid_job(job_data)
@@ -225,8 +279,15 @@ class LLMJobClassifyOrchestrator:
                         else:
                             print(f" [DRY RUN] Would mark as 'parsed' (junk).")
                         
+                        stats["junk"] += 1
+                        records["junk"].append({
+                            "raw_job": raw_job,
+                            "llm_result": result
+                        })
+                        
                 except Exception as e:
                     logger.error(f" Error processing ID {raw_id}: {e}")
+                    stats["errors"] += 1
                     continue
             
             # Smart Pagination: Always move forward by the number of records we looked at
@@ -240,12 +301,60 @@ class LLMJobClassifyOrchestrator:
                 print("="*60 + "\n")
                 break
             
+            # Print intermediate stats
+            print(f"\nStats so far: Classified Valid: {stats['classified_valid']} | Finalized NER: {stats['finalized_after_ner']} | Junk: {stats['junk']}")
+            
             time.sleep(1)
+        
+        # Final Report
+        print("\n" + "="*60)
+        print(" FINAL CLASSIFICATION & NER REPORT")
+        print("="*60)
+        print(f" Total Processed     : {stats['total']}")
+        print(f" Classified Valid    : {stats['classified_valid']}")
+        print(f" Finalized after NER : {stats['finalized_after_ner']}")
+        print(f" Filtered as Junk    : {stats['junk']}")
+        print(f" Errors Encountered  : {stats['errors']}")
+        print("="*60)
+        
+        # 6. Save records to JSON
+        output_dir = Path("output/classification_results")
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        
+        for category, data in records.items():
+            filename = output_dir / f"classification_{category}_{timestamp}.json"
+            
+            # Wrap records with summary metadata at the top
+            result_package = {
+                "summary": {
+                    "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "total_processed": stats["total"],
+                    "classified_valid": stats["classified_valid"],
+                    "finalized_after_ner": stats["finalized_after_ner"],
+                    "junk_count": stats["junk"],
+                    "errors_encountered": stats["errors"],
+                    "file_category": category,
+                    "file_record_count": len(data)
+                },
+                "records": data
+            }
+            
+            try:
+                with open(filename, "w", encoding="utf-8") as f:
+                    json.dump(result_package, f, indent=2, ensure_ascii=False, cls=DateTimeEncoder)
+                print(f" Saved {category:9} records to: {filename}")
+            except Exception as e:
+                logger.error(f" Failed to save {category} JSON: {e}")
+                
+        print("="*60)
+        logger.info(f"Classification run complete. Stats: {stats}")
 
     def _log_audit(self, raw_id: int, result: dict):
         timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
         reasoning = result.get('reasoning', 'N/A').replace('\n', ' ')
-        entry = (
+b-7        entry = (
             f"{timestamp} | ID: {raw_id:6} | Label: {result['label']:10} | "
             f"Score: {result['score']:.2f} | Reasoning: {reasoning[:100]}...\n"
         )

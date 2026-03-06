@@ -90,7 +90,7 @@ Log Activity
    Edit `.env` with your credentials:
    ```env
    # API Configuration
-   API_BASE_URL=https://whitebox-learning.com
+   API_BASE_URL=https://api.whitebox-learning.com
    API_EMAIL=your@email.com
    API_PASSWORD=your_password
    EMPLOYEE_ID=your_employee_id
