@@ -10,7 +10,7 @@ A production-ready email processing service that automatically extracts recruite
 
 - **Multi-Method Extraction**: Regex → SpaCy → GLiNER fallback pipeline for maximum accuracy
 - **Smart Filtering**: Database-driven junk/recruiter detection with BERT and LLM classifiers
-- **LLM Job Classification**: High-accuracy job validation using local LLM (Ollama/FastAPI)
+- **Job Classification (Ollama/Groq)**: High-accuracy job validation using local or cloud LLMs
 - **Zero-Shot NER**: GLiNER model extracts contacts without predefined patterns
 - **Multiple Contact Sources**: Extracts from From, Reply-To, Sender, CC, and calendar invites
 - **Duplicate Prevention**: Automatic deduplication by email and LinkedIn ID
@@ -90,7 +90,7 @@ Log Activity
    Edit `.env` with your credentials:
    ```env
    # API Configuration
-   API_BASE_URL=https://whitebox-learning.com
+   API_BASE_URL=https://api.whitebox-learning.com
    API_EMAIL=your@email.com
    API_PASSWORD=your_password
    EMPLOYEE_ID=your_employee_id
@@ -110,19 +110,75 @@ Log Activity
 
 ## 🚀 Usage
 
-### Job Classification (Local LLM)
-Process and validate all raw job positions in a continuous loop using a local LLM (Ollama-backed). One command will process thousands of records by fetching them batch by batch until none are left:
+### 📧 Email Extraction Workflow
+
+The main workflow for processing candidate inboxes end-to-end. It fetches emails, extracts recruiter/job info, and routes data based on validation results.
 
 ```bash
-python llm_based_classifier.py --batch-size 15
+# Run the complete email extraction workflow
+python src/run_workflow.py --workflow-key email_extractor
 ```
 
-**Key Features:**
-- **Deterministic Output**: Enforces prompt-based JSON generation for reliable parsing.
-- **Fail-Safe Persistence**: Updates raw records to `parsed` only after successful classification AND database save.
-- **Clean Logging**: Text-based terminal output with progress indicators and role inspection summaries.
-- **Dry Run**: Test the logic without modifying data: `python llm_based_classifier.py --dry-run`.
+**Features:**
+- **Incremental Processing**: Uses UID tracking to only process new messages.
+- **Multi-Inbox Support**: Fetches candidate credentials from the database and processes all active inboxes.
+- **NER-Based Routing**: 
+  - ✅ **Finalized**: Jobs passing strict NER validation are sent to `/api/positions/` (Job Listings).
+  - ⚠️ **Fallback**: Jobs failing NER but containing a valid email are sent to `/api/email-positions/bulk` (Email Positions).
+- **Audit Logs**: Generates categorized JSON results in `output/extraction_results/` and detailed summary reports in `output/reports/`.
 
+---
+
+### 🤖 Job Classification & Validation
+
+This service uses LLMs (Groq or Local Ollama) to classify raw job descriptions into `valid_job` or `junk` with high precision.
+
+#### 1. Setup Infrastructure
+The classifier works best with a local LLM to avoid rate limits and costs.
+
+**Option A: Local Ollama (Recommended)**
+1. Navigate to the LLM infrastructure directory:
+   ```bash
+   cd ../project-Ollama-local-llm
+   ```
+2. Start the Docker containers:
+   ```bash
+   docker-compose up -d
+   ```
+3. **Crucial**: Pull the required model inside the container:
+   ```bash
+   docker exec ollama ollama pull qwen2.5:1.5b
+   ```
+4. Verify the API is healthy:
+   ```bash
+   curl http://localhost:8000/health
+   ```
+
+**Option B: Groq Cloud (Fastest)**
+Add your API key to `.env`:
+```env
+GROQ_API_KEY=your_gsk_key_here
+MODEL_NAME=llama-3.1-8b-instant
+```
+
+#### 2. Run Classification
+Go back to the main project and start the classification loop:
+
+```bash
+# Production Run
+python llm_based_classifier.py --batch-size 20
+
+# Dry Run (Test logic without saving to DB)
+python llm_based_classifier.py --dry-run --batch-size 10
+```
+
+**Features:**
+- **Persistent Progress**: Processes batches of raw records and marks them `parsed` in the database.
+- **Auto-Retry**: Built-in retry logic with exponental backoff for API reliability.
+- **Audit Logging**: Detailed reasoning for every classification saved to `classification_audit_llm.log`.
+- **Normalization**: Automatically maps job types and work modes to valid database enums.
+
+---
 ### Test Mode (No Database Required)
 
 [Note: test_my_account.py is currently unavailable]
@@ -227,6 +283,7 @@ docker run --env-file .env \
 | Script | Purpose |
 |--------|---------|
 | `service.py` | Main production service |
+| `run_workflow.py` | Universal workflow runner (e.g., email_extractor) |
 | `llm_based_classifier.py` | LLM-powered job classification engine |
 | `diagnose_account.py` | IMAP connection troubleshooting |
 | `sync_keywords_to_csv.py` | Sync database filters to CSV |
